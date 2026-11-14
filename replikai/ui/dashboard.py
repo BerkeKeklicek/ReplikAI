@@ -637,13 +637,13 @@ class ReplikAIDashboard(QMainWindow):
         cv.setContentsMargins(20, 18, 20, 18)
         cv.setSpacing(14)
 
-        cv.addWidget(self._section_label("🎨  HAZIR SİNEMATİK ALTYAZI TEMALARI"))
+        cv.addWidget(self._section_label("🎨  HAZIR SİNEMATİK ALTYAZI TEMALARI (ETRAFI TEMİZ / KUTUSUZ)"))
         preset_row = QHBoxLayout()
         presets = [
-            ("🤠 RDR2 Kehribar Sarısı", "#FFF3B0", "#0B0E14"),
-            ("🎥 Sinema / Netflix Altın", "#FFE66D", "#101218"),
-            ("❄️ GTA 5 / Ambarino Saf Beyaz", "#FFFFFF", "#090D16"),
-            ("⚡ Cyberpunk Neon Camgöbeği", "#00F5D4", "#08121E"),
+            ("🖤 Saf Siyah Metin (Etrafı Temiz)", "#090D14", "#0B0E14"),
+            ("❄️ Saf Beyaz Metin (Etrafı Temiz)", "#FFFFFF", "#090D16"),
+            ("🤠 RDR2 Kehribar Sarısı (Etrafı Temiz)", "#FFF3B0", "#0B0E14"),
+            ("🎥 Sinema Altın Sarısı (Etrafı Temiz)", "#FFE66D", "#101218"),
         ]
         for title, fg, bg in presets:
             b = QPushButton(title)
@@ -660,23 +660,25 @@ class ReplikAIDashboard(QMainWindow):
         self.lbl_font_val = QLabel(f"Altyazı Boyutu: {self.config_data.overlay_font_size} px")
         grid.addWidget(self.lbl_font_val, 0, 0)
         self.slider_font = QSlider(Qt.Orientation.Horizontal)
-        self.slider_font.setRange(14, 36)
+        self.slider_font.setRange(14, 38)
         self.slider_font.setValue(int(self.config_data.overlay_font_size))
         self.slider_font.valueChanged.connect(self._on_overlay_sliders_changed)
         grid.addWidget(self.slider_font, 0, 1)
 
-        self.lbl_opac_val = QLabel(f"Arka Plan Opaklığı: %{int(self.config_data.overlay_opacity * 100)}")
+        opac_pct = int(self.config_data.overlay_opacity * 100)
+        opac_desc = "Kutusu Yok / Etrafı Temiz" if opac_pct <= 2 else f"%{opac_pct}"
+        self.lbl_opac_val = QLabel(f"Arka Plan Kutusu: {opac_desc}")
         grid.addWidget(self.lbl_opac_val, 1, 0)
         self.slider_opac = QSlider(Qt.Orientation.Horizontal)
-        self.slider_opac.setRange(35, 100)
-        self.slider_opac.setValue(int(self.config_data.overlay_opacity * 100))
+        self.slider_opac.setRange(0, 100)
+        self.slider_opac.setValue(opac_pct)
         self.slider_opac.valueChanged.connect(self._on_overlay_sliders_changed)
         grid.addWidget(self.slider_opac, 1, 1)
 
         self.lbl_interval_val = QLabel(f"Ekran Tarama Hızı: {self.config_data.scan_interval_ms} ms")
         grid.addWidget(self.lbl_interval_val, 2, 0)
         self.slider_interval = QSlider(Qt.Orientation.Horizontal)
-        self.slider_interval.setRange(250, 1200)
+        self.slider_interval.setRange(150, 1200)
         self.slider_interval.setSingleStep(50)
         self.slider_interval.setValue(int(self.config_data.scan_interval_ms))
         self.slider_interval.valueChanged.connect(self._on_overlay_sliders_changed)
@@ -800,10 +802,6 @@ class ReplikAIDashboard(QMainWindow):
 
     def _on_profile_changed(self, profile_name: str) -> None:
         self.config_data.game_genre = profile_name
-        profile = GAME_PROFILES.get(profile_name, {})
-        if "subtitle_color" in profile:
-            self.config_data.overlay_text_color = profile["subtitle_color"]
-            self.overlay.apply_config()
         self.metric_profile[1].setText(profile_name.split(" (")[0])
         self._update_prompt_preview()
         self.config_data.save()
@@ -814,6 +812,8 @@ class ReplikAIDashboard(QMainWindow):
     def _apply_theme_preset(self, fg_hex: str, bg_hex: str) -> None:
         self.config_data.overlay_text_color = fg_hex
         self.config_data.overlay_bg_color = bg_hex
+        self.config_data.overlay_opacity = 0.0
+        self.slider_opac.setValue(0)
         self.config_data.save()
         self.overlay.apply_config()
 
@@ -824,7 +824,9 @@ class ReplikAIDashboard(QMainWindow):
         self.config_data.show_original_text = bool(self.chk_show_orig.isChecked())
 
         self.lbl_font_val.setText(f"Altyazı Boyutu: {self.config_data.overlay_font_size} px")
-        self.lbl_opac_val.setText(f"Arka Plan Opaklığı: %{int(self.config_data.overlay_opacity * 100)}")
+        opac_pct = int(self.config_data.overlay_opacity * 100)
+        opac_desc = "Kutusu Yok / Etrafı Temiz" if opac_pct <= 2 else f"%{opac_pct}"
+        self.lbl_opac_val.setText(f"Arka Plan Kutusu: {opac_desc}")
         self.lbl_interval_val.setText(f"Ekran Tarama Hızı: {self.config_data.scan_interval_ms} ms")
 
         self.config_data.save()

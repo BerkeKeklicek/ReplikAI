@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -113,6 +114,29 @@ class ScreenCapturer:
 
         if not force and diff_score < diff_threshold:
             return None, diff_score
+
+        # Kelime kelime ekrana zıplayan (pop-in animasyonlu) altyazılarda ("You got" -> "You got no teammate.")
+        # harfler hala ekrana eklenmeye devam ediyorsa animasyon sabitlenene kadar (maks 3x 60ms) bekle:
+        if not force:
+            for _ in range(3):
+                time.sleep(0.060)
+                sct_next = sct.grab(monitor)
+                bgra_next = np.asarray(sct_next, dtype=np.uint8)
+                rgb_next = bgra_next[:, :, [2, 1, 0]].copy()
+                mask_next = self.extract_outlined_subtitle_mask(rgb_next)
+                if int(np.count_nonzero(mask_next)) < 42:
+                    break
+                small_next = cv2.resize(mask_next, (160, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
+                c_bin = small_next > 18.0
+                p_bin = small_mask > 18.0
+                u_cnt = int(np.count_nonzero(c_bin | p_bin))
+                x_cnt = int(np.count_nonzero(c_bin ^ p_bin))
+                step_xor = float(x_cnt) / float(max(1, u_cnt))
+                rgb_arr = rgb_next
+                small_mask = small_next
+                # İki kare arasında yeni kelime/harf eklenmediyse (animasyon tamamlandıysa) hemen çık
+                if step_xor <= 0.045:
+                    break
 
         self._last_subtitle_mask_small = small_mask
         return Image.fromarray(rgb_arr), diff_score

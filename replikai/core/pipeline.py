@@ -150,7 +150,8 @@ class TranslationPipeline:
         if img is None:
             return None
 
-        t_ocr_start = time.perf_counter()
+        t0 = time.perf_counter()
+        t_ocr_start = t0
         raw_text = self.ocr.extract_text(img)
         ocr_ms = (time.perf_counter() - t_ocr_start) * 1000.0
 
@@ -158,32 +159,13 @@ class TranslationPipeline:
         if not cleaned:
             return None
 
-        # Kelime kelime ekrana zıplayan (pop-in animasyonlu) altyazılarda ("Whoever" -> "Whoever wins this")
-        # tek kelime yakalandıysa 75ms bekleyip cümlenin tamamlanıp tamamlanmadığını kontrol et
-        if not force and len(cleaned.split()) == 1:
-            time.sleep(0.075)
-            t0 = time.perf_counter()
-            img2, _ = self.capturer.capture_region(
-                region=self.config.capture_region,
-                diff_threshold=self.config.pixel_diff_threshold,
-                preprocess=self.config.preprocess_contrast,
-                force=True,
-                target_hwnd=self.target_hwnd,
-            )
-            if img2 is not None:
-                t_ocr2 = time.perf_counter()
-                cleaned2 = normalize_ocr_text(self.ocr.extract_text(img2))
-                if cleaned2 and len(cleaned2) > len(cleaned):
-                    cleaned = cleaned2
-                    ocr_ms = (time.perf_counter() - t_ocr2) * 1000.0
-
         self._empty_ticks = 0
         if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
             return None
 
         # Dinamik Kurgulu Cümle Birleştirici ("Whoever wins this" -> "let's team up"):
-        # Videolarda tek bir cümle iki ayrı altyazı kartına bölündüyse (< 3.4 sn içinde),
-        # ikinci yarı geldiğinde tam cümleyi ("Whoever wins this, let's team up") birleştirerek çevir!
+        # Sadece ilk kart yarım bir yan cümleyse veya ikinci kart küçük harfle / "let's" ile devam ediyorsa birleştir;
+        # birleştirme yapıldıktan sonra zincirleme 3. cümlenin yapışmaması için _prev_clause_text'i sıfırla!
         now_ts = time.perf_counter()
         query_text = cleaned
         is_joined_clause = False
@@ -197,18 +179,52 @@ class TranslationPipeline:
         ):
             prev_low = prev_clean.lower()
             cur_low = cleaned.lower()
-            # Eğer yeni metin öncekinin kelime uzantısı değilse (ayrı bir ikinci kartsa) birleştir
-            if not cur_low.startswith(prev_low[: min(7, len(prev_low))]) and not prev_low.startswith(
+            is_extension = cur_low.startswith(prev_low[: min(7, len(prev_low))]) or prev_low.startswith(
                 cur_low[: min(7, len(cur_low))]
-            ):
+            )
+            subordinate_starts = (
+                "whoever",
+                "whatever",
+                "whenever",
+                "wherever",
+                "if ",
+                "when ",
+                "while ",
+                "unless ",
+                "until ",
+                "because ",
+                "every time",
+                "as soon as",
+            )
+            dangling_ends = (
+                ",",
+                " to",
+                " with",
+                " for",
+                " of",
+                " in",
+                " on",
+                " and",
+                " or",
+                " that",
+                " the",
+                " a",
+            )
+            is_continuation = (
+                prev_low.startswith(subordinate_starts)
+                or prev_low.endswith(dangling_ends)
+                or cleaned[0].islower()
+                or cur_low.startswith(("let's", "lets"))
+            )
+            if not is_extension and is_continuation:
                 query_text = f"{prev_clean.rstrip(',')}, {cleaned}"
                 is_joined_clause = True
 
-        # Gelecekteki yarım cümle devamı için mevcut kartı kaydet
         self._last_ocr_text = cleaned
         if is_joined_clause:
-            self._prev_clause_text = cleaned
-            self._prev_clause_time = now_ts
+            # İki yarım kart birleştirildikten sonra 3. kartın yanına yapışmaması için sıfırla
+            self._prev_clause_text = ""
+            self._prev_clause_time = 0.0
         else:
             self._prev_clause_text = cleaned
             self._prev_clause_time = now_ts

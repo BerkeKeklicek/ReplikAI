@@ -116,12 +116,13 @@ class AppConfig:
     ollama_model: str = "gemma2:9b"
 
     # Overlay (Altyazı Katmanı) Ayarları
-    overlay_font_size: int = 21
-    overlay_opacity: float = 0.88
-    overlay_text_color: str = "#FFF3B0"
+    # overlay_opacity = 0.0 -> Etrafında hiçbir siyah kutu/tabaka olmadan sadece temiz metin!
+    overlay_font_size: int = 23
+    overlay_opacity: float = 0.0
+    overlay_text_color: str = "#090D14"
     overlay_bg_color: str = "#0B0E14"
     overlay_click_through: bool = True
-    show_original_text: bool = True
+    show_original_text: bool = False
 
     # Kısayollar
     hotkey_toggle_scan: str = "alt+t"

@@ -95,6 +95,17 @@ def test_translator_prompt_and_fallback() -> None:
     assert len(es_tr) > 2
     assert es_prov != "tr_ignored"
 
+    # Sahne Bağlamı Testi: Önceki cümlede aksiyon/tehlike varken "Hey Michael" -> "Merhaba Michael" OLMAMALI!
+    translator.translate("Watch out, the cops are right behind us!")
+    hey_tr, _ = translator.translate("Hey Michael!")
+    assert "merhaba" not in hey_tr.lower()
+    assert "baksana" in hey_tr.lower() or "hey" in hey_tr.lower()
+
+    # Eleme / Yarışma Bağlamı Testi: "AKIRA GOT OUT!" -> "AKIRA elendi!"
+    translator.translate("I got the first elimination in this game.")
+    elim_tr, _ = translator.translate("Akira got out!")
+    assert "elendi" in elim_tr.lower()
+
 
 def test_3d_background_subtitle_mask_filter() -> None:
     # Altyazı olmayan parlak yol/gökyüzü karesinde konturlu altyazı pikseli 0 çıkmalı

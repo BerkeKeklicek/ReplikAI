@@ -64,7 +64,10 @@ def normalize_ocr_text(text: str) -> str:
     cleaned = re.sub(r"[\r\n\t]+", " ", text)
     # Küçük harften hemen sonra gelen büyük harfi ayır ("returnTo" / "AGood" -> "A Good")
     cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" _|~`^•·")
+    # Arka plan/kontur kaynaklı anlamsız OCR ses/harf gürültülerini temizle ('h NGH!', 'u GHgh!', 'UR')
+    cleaned = re.sub(r"\b(?:[uUhH]\s+)?(?:NGH|GHgh|HH|UR)\b[!?.]*", "", cleaned)
+    cleaned = re.sub(r"\bWhoeuer\b", "Whoever", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,_|~`^•·")
 
     # Uzun altyazıların en sonuna çerçeve/kontur yüzünden eklenen tek harfli ' A' veya ' |' gürültüsünü temizle
     raw_words = cleaned.split()
