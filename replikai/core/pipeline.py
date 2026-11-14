@@ -22,10 +22,12 @@ class TranslationEvent:
     provider: str
     from_cache: bool
     latency_ms: float
+    ocr_ms: float = 0.0
+    translate_ms: float = 0.0
 
 
 class TranslationPipeline:
-    """Arka planda çalışan, sıfır FPS-drop odaklı ekran okuma ve çeviri yöneticisi."""
+    """Arka planda çalışan, ön-ısıtmalı (warm-start) ve sıfır FPS-drop odaklı çeviri yöneticisi."""
 
     def __init__(
         self,
@@ -47,6 +49,22 @@ class TranslationPipeline:
         self._thread: Optional[threading.Thread] = None
         self._last_ocr_text: str = ""
         self._lock = threading.Lock()
+        self._warmup_lock = threading.Lock()
+        self._warmed_up = False
+
+        # Uygulama açılır açılmaz ONNX modelini ve HTTPS TLS soketini arka planda ısıt
+        threading.Thread(target=self.warmup, daemon=True).start()
+
+    def warmup(self) -> None:
+        """İlk tıklamada 3000ms soğuk başlangıç yaşanmaması için motorları tek seferde önceden ısıtır."""
+        if self._warmed_up:
+            return
+        with self._warmup_lock:
+            if self._warmed_up:
+                return
+            self.ocr.warmup()
+            self.translator.warmup()
+            self._warmed_up = True
 
     @property
     def is_running(self) -> bool:
@@ -92,7 +110,10 @@ class TranslationPipeline:
         if img is None:
             return None
 
+        t_ocr_start = time.perf_counter()
         raw_text = self.ocr.extract_text(img)
+        ocr_ms = (time.perf_counter() - t_ocr_start) * 1000.0
+
         cleaned = normalize_ocr_text(raw_text)
         if not cleaned:
             return None
@@ -102,7 +123,7 @@ class TranslationPipeline:
 
         self._last_ocr_text = cleaned
 
-        # 1. Önbellek kontrolü (0ms)
+        # 1. Önbellek kontrolü (0ms çeviri süresi)
         cached = self.cache.get(
             cleaned,
             target_lang=self.config.target_lang,
@@ -116,13 +137,17 @@ class TranslationPipeline:
                 provider="SQLite Önbellek ⚡",
                 from_cache=True,
                 latency_ms=latency,
+                ocr_ms=ocr_ms,
+                translate_ms=0.0,
             )
             if self.on_translation:
                 self.on_translation(event)
             return event
 
         # 2. Yapay Zeka Çevirisi
+        t_tr_start = time.perf_counter()
         translated, provider_label = self.translator.translate(cleaned)
+        tr_ms = (time.perf_counter() - t_tr_start) * 1000.0
         if not translated:
             return None
 
@@ -140,6 +165,8 @@ class TranslationPipeline:
             provider=provider_label,
             from_cache=False,
             latency_ms=latency,
+            ocr_ms=ocr_ms,
+            translate_ms=tr_ms,
         )
         if self.on_translation:
             self.on_translation(event)

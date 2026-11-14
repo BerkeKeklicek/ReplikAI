@@ -952,6 +952,8 @@ class ReplikAIDashboard(QMainWindow):
                     provider=provider_label,
                     from_cache=False,
                     latency_ms=dt,
+                    ocr_ms=0.0,
+                    translate_ms=dt,
                 )
                 self.signals.translation_ready.emit(ev)
 
@@ -963,16 +965,22 @@ class ReplikAIDashboard(QMainWindow):
             original=event.source_text,
             provider=event.provider,
         )
-        self.metric_latency[1].setText(f"{event.latency_ms:.0f} ms • {event.provider.split(' ')[0]}")
+        self.metric_latency[1].setText(
+            f"{event.latency_ms:.0f} ms (OCR:{event.ocr_ms:.0f}/Ağ:{event.translate_ms:.0f})"
+        )
         self.metric_cache[1].setText(f"{self.pipeline.cache.count()} Kayıtlı Replik")
 
         ts = datetime.now().strftime("%H:%M:%S")
         badge_color = "#00F5D4" if event.from_cache else "#FBBF24"
+        detail_ms = (
+            f"⚡ Toplam: {event.latency_ms:.0f} ms "
+            f"(OCR: {event.ocr_ms:.0f} ms • Çeviri: {event.translate_ms:.0f} ms)"
+        )
         card_html = (
             f"<div style='background-color:#111827; border:1px solid #1F2937; border-left:4px solid {badge_color}; "
             f"padding:10px 14px; border-radius:8px; margin-bottom:8px;'>"
             f"<div style='font-size:11px; color:#64748B;'>"
-            f"🕒 {ts} &nbsp;|&nbsp; <b style='color:{badge_color};'>{event.provider}</b> &nbsp;|&nbsp; ⚡ {event.latency_ms:.0f} ms"
+            f"🕒 {ts} &nbsp;|&nbsp; <b style='color:{badge_color};'>{event.provider}</b> &nbsp;|&nbsp; {detail_ms}"
             f"</div>"
             f"<div style='color:#94A3B8; font-size:12px; margin-top:4px;'><i>🇬🇧 {event.source_text}</i></div>"
             f"<div style='color:#FFF3B0; font-size:14px; font-weight:600; margin-top:3px;'>🇹🇷 {event.translated_text}</div>"
