@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import numpy as np
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
+from replikai.core.capture import ScreenCapturer
 from replikai.core.ocr_engine import OCREngine
 from replikai.core.translator import GameTranslator
 
@@ -78,3 +80,18 @@ def test_translator_prompt_and_fallback() -> None:
     translated, provider = translator.translate("Stay awhile and listen!")
     assert len(translated) > 2
     assert provider != "none"
+
+
+def test_3d_background_subtitle_mask_filter() -> None:
+    # Altyazı olmayan parlak yol/gökyüzü karesinde konturlu altyazı pikseli 0 çıkmalı
+    road_frame = np.full((120, 600, 3), 140, dtype=np.uint8)
+    road_frame[0:40, :] = 230  # Parlak gökyüzü (siyah konturu yok)
+    mask_empty = ScreenCapturer.extract_outlined_subtitle_mask(road_frame)
+    assert int(np.count_nonzero(mask_empty)) == 0
+
+    # Siyah konturlu GTA 5 altyazısı eklendiğinde maske harfleri yakalamalı
+    img = Image.fromarray(road_frame)
+    draw = ImageDraw.Draw(img)
+    draw.text((40, 60), "Franklin, get in the car!", fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0))
+    mask_sub = ScreenCapturer.extract_outlined_subtitle_mask(np.asarray(img))
+    assert int(np.count_nonzero(mask_sub)) > 50

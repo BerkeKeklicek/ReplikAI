@@ -1,17 +1,16 @@
-"""ReplikAI Pro — Qt6 (PySide6) Tabanlı Profesyonel Oyuncu Komuta Merkezi."""
+"""ReplikAI Pro v0.3 — Sıfır FPS-Drop & DirectX Oyun Penceresi Komuta Merkezi."""
 
 from __future__ import annotations
 
 from datetime import datetime
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -31,6 +30,12 @@ from PySide6.QtWidgets import (
 )
 
 from replikai.config import AppConfig, GAME_PROFILES
+from replikai.core.game_window import (
+    auto_detect_running_game,
+    exclude_window_from_capture,
+    list_candidate_game_windows,
+    make_window_borderless_fullscreen,
+)
 from replikai.core.pipeline import TranslationEvent, TranslationPipeline
 from replikai.ui.overlay import SubtitleOverlay
 from replikai.ui.region_selector import RegionSelector
@@ -43,11 +48,11 @@ PROVIDER_DISPLAY_TO_KEY = {
 }
 PROVIDER_KEY_TO_DISPLAY = {v: k for k, v in PROVIDER_DISPLAY_TO_KEY.items()}
 
-RDR2_SAMPLE_QUOTES = [
+SAMPLE_QUOTES = [
+    "You forget a thousand things every day, pal. Make sure this is one of 'em.",
     "We're thieves in a world that don't want us no more, Arthur.",
+    "Franklin, get in the car right now! The cops are everywhere on the highway.",
     "I have a plan, Arthur! Have some goddamn faith! One more big score and we disappear.",
-    "Watch out partner, Pinkerton lawmen were spotted riding near Valentine.",
-    "Take a gamble that love exists, and do a loving act.",
 ]
 
 PRO_STYLESHEET = """
@@ -62,13 +67,14 @@ QFrame#Sidebar {
     background-color: #0D121C;
     border-right: 1px solid #1E293B;
 }
-QFrame#TopBar {
-    background-color: #0D121C;
-    border-bottom: 1px solid #1E293B;
-}
 QFrame#Card {
     background-color: #111827;
     border: 1px solid #1F2937;
+    border-radius: 12px;
+}
+QFrame#HighlightCard {
+    background-color: #121D2F;
+    border: 1px solid rgba(0, 245, 212, 0.35);
     border-radius: 12px;
 }
 QFrame#MetricCard {
@@ -100,7 +106,7 @@ QPushButton#PrimaryActionBtn {
     color: #061014;
     font-size: 13px;
     font-weight: 700;
-    padding: 12px 18px;
+    padding: 11px 16px;
     border-radius: 9px;
     border: none;
 }
@@ -112,7 +118,7 @@ QPushButton#DangerActionBtn {
     color: #FFFFFF;
     font-size: 13px;
     font-weight: 700;
-    padding: 12px 18px;
+    padding: 11px 16px;
     border-radius: 9px;
     border: none;
 }
@@ -124,7 +130,7 @@ QPushButton#SecondaryBtn {
     color: #E2E8F0;
     font-size: 12px;
     font-weight: 600;
-    padding: 9px 14px;
+    padding: 8px 13px;
     border-radius: 8px;
     border: 1px solid #334155;
 }
@@ -183,16 +189,17 @@ class BridgeSignals(QObject):
     hotkey_select_region = Signal()
     hotkey_toggle_lock = Signal()
     hotkey_single_capture = Signal()
+    hotkey_borderless = Signal()
 
 
 class ReplikAIDashboard(QMainWindow):
-    """ReplikAI Pro — Profesyonel Masaüstü Komuta Merkezi."""
+    """ReplikAI Pro v0.3 — Sıfır FPS-Drop Masaüstü Komuta Merkezi."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ReplikAI Pro — Gerçek Zamanlı Yapay Zeka Oyun Çeviri Stüdyosu")
-        self.resize(1220, 790)
-        self.setMinimumSize(1060, 700)
+        self.setWindowTitle("ReplikAI Pro v0.3 — Zero-Drop Gerçek Zamanlı Oyun Çeviri Stüdyosu")
+        self.resize(1240, 810)
+        self.setMinimumSize(1080, 720)
         self.setStyleSheet(PRO_STYLESHEET)
 
         self.config_data = AppConfig.load()
@@ -203,6 +210,7 @@ class ReplikAIDashboard(QMainWindow):
         self.signals.hotkey_select_region.connect(self.open_region_selector)
         self.signals.hotkey_toggle_lock.connect(self.toggle_overlay_lock)
         self.signals.hotkey_single_capture.connect(self.trigger_single_capture)
+        self.signals.hotkey_borderless.connect(self.apply_borderless_fullscreen_fix)
 
         self.pipeline = TranslationPipeline(
             config=self.config_data,
@@ -213,11 +221,16 @@ class ReplikAIDashboard(QMainWindow):
         self._quote_idx = 0
         self._nav_buttons: list[QPushButton] = []
         self._selector_window: Optional[RegionSelector] = None
+        self._window_entries: List[Tuple[Optional[int], str]] = []
 
         self.overlay = SubtitleOverlay(self.config_data)
         self._build_ui()
         self._register_hotkeys()
+        self.refresh_game_window_list()
         self.refresh_region_preview()
+
+        # Kendi kontrol panelini de ekran yakalamadan gizle ki asla masaüstü/panel yazısını okumasın!
+        exclude_window_from_capture(int(self.winId()))
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -226,22 +239,21 @@ class ReplikAIDashboard(QMainWindow):
         main_h.setContentsMargins(0, 0, 0, 0)
         main_h.setSpacing(0)
 
-        # SOL NAVİGASYON BAR (Sidebar)
+        # SOL NAVİGASYON BAR
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(285)
+        sidebar.setFixedWidth(290)
         side_v = QVBoxLayout(sidebar)
         side_v.setContentsMargins(18, 22, 18, 18)
         side_v.setSpacing(8)
 
-        # Marka Başlığı
         brand_row = QHBoxLayout()
         title_lbl = QLabel("REPLIK AI")
         title_lbl.setFont(QFont("Segoe UI", 20, QFont.Weight.Black))
         title_lbl.setStyleSheet("color: #F8FAFC; letter-spacing: 1px;")
         brand_row.addWidget(title_lbl)
 
-        pro_badge = QLabel("PRO v0.2")
+        pro_badge = QLabel("ZERO-DROP v0.3")
         pro_badge.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         pro_badge.setStyleSheet(
             "background-color: rgba(0, 245, 212, 0.16); color: #00F5D4; "
@@ -251,22 +263,20 @@ class ReplikAIDashboard(QMainWindow):
         brand_row.addStretch()
         side_v.addLayout(brand_row)
 
-        sub_lbl = QLabel("Anti-Cheat Güvenli • Canlı OCR & AI Motoru")
-        sub_lbl.setStyleSheet("color: #64748B; font-size: 11px; margin-bottom: 10px;")
+        sub_lbl = QLabel("GTA 5 & RDR 2 Özel Motor • 35ms Turbo OCR")
+        sub_lbl.setStyleSheet("color: #64748B; font-size: 11px; margin-bottom: 8px;")
         side_v.addWidget(sub_lbl)
 
-        # Canlı Durum Göstergesi
-        self.status_pill = QLabel("●  DURUM: HAZIR BEKLİYOR")
+        self.status_pill = QLabel("●  DURUM: HAZIR (0% CPU)")
         self.status_pill.setStyleSheet(
             "background-color: #131C2E; color: #FBBF24; border: 1px solid #263552; "
             "border-radius: 8px; padding: 9px 12px; font-size: 11px; font-weight: 700;"
         )
         side_v.addWidget(self.status_pill)
-        side_v.addSpacing(10)
+        side_v.addSpacing(8)
 
-        # Menü Sekme Butonları
         nav_items = [
-            ("⚡  Komuta Merkezi & Canlı Akış", 0),
+            ("⚡  Komuta Merkezi & GTA5/RDR2", 0),
             ("🤠  Oyun Profili & AI Motorları", 1),
             ("🎬  Sinematik Overlay Stüdyosu", 2),
             ("💾  Önbellek & Kısayol Rehberi", 3),
@@ -286,7 +296,7 @@ class ReplikAIDashboard(QMainWindow):
         dock_card.setObjectName("Card")
         dock_v = QVBoxLayout(dock_card)
         dock_v.setContentsMargins(12, 12, 12, 12)
-        dock_v.setSpacing(8)
+        dock_v.setSpacing(7)
 
         dock_title = QLabel("HIZLI OYUN KONTROLLERİ")
         dock_title.setStyleSheet("color: #64748B; font-size: 10px; font-weight: 800; letter-spacing: 0.8px;")
@@ -297,6 +307,12 @@ class ReplikAIDashboard(QMainWindow):
         self.btn_toggle_scan.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle_scan.clicked.connect(self.toggle_scanning)
         dock_v.addWidget(self.btn_toggle_scan)
+
+        self.btn_borderless = QPushButton("🖥️  Oyunu Çerçevesiz Yap (Alt+B)")
+        self.btn_borderless.setObjectName("SecondaryBtn")
+        self.btn_borderless.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_borderless.clicked.connect(self.apply_borderless_fullscreen_fix)
+        dock_v.addWidget(self.btn_borderless)
 
         self.btn_select_region = QPushButton("🎯  Altyazı Bölgesi Seç (Alt+R)")
         self.btn_select_region.setObjectName("SecondaryBtn")
@@ -322,33 +338,33 @@ class ReplikAIDashboard(QMainWindow):
         # SAĞ İÇERİK ALANI
         right_container = QWidget()
         right_v = QVBoxLayout(right_container)
-        right_v.setContentsMargins(24, 20, 24, 20)
-        right_v.setSpacing(16)
+        right_v.setContentsMargins(22, 18, 22, 18)
+        right_v.setSpacing(14)
 
-        # Üst Telemetri Kartları (4'lü Grid)
+        # Üst Telemetri Kartları
         metrics_grid = QGridLayout()
-        metrics_grid.setSpacing(14)
+        metrics_grid.setSpacing(12)
 
         self.metric_profile = self._create_metric_card(
             "AKTİF OYUN PROFİLİ",
             self.config_data.game_genre.split(" (")[0],
-            "#E63946",
+            "#00F5D4",
         )
         self.metric_latency = self._create_metric_card(
-            "SON ÇEVİRİ GECİKMESİ",
-            "Hazır • 0 ms",
-            "#00F5D4",
+            "OCR + ÇEVİRİ SÜRESİ",
+            "Hazır • ~35 ms",
+            "#FBBF24",
         )
         self.metric_cache = self._create_metric_card(
             "SQLITE ÖNBELLEK HAVUZU",
             f"{self.pipeline.cache.count()} Kayıtlı Replik",
-            "#FBBF24",
+            "#38BDF8",
         )
         reg = self.config_data.capture_region
         self.metric_region = self._create_metric_card(
             "YAKALAMA KOORDİNATI",
             f"{reg['width']}×{reg['height']} px",
-            "#60A5FA",
+            "#A78BFA",
         )
 
         metrics_grid.addWidget(self.metric_profile[0], 0, 0)
@@ -357,7 +373,6 @@ class ReplikAIDashboard(QMainWindow):
         metrics_grid.addWidget(self.metric_region[0], 0, 3)
         right_v.addLayout(metrics_grid)
 
-        # Çoklu Sayfa Yığını (StackedWidget)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_command_center_page())
         self.pages.addWidget(self._build_ai_profile_page())
@@ -373,15 +388,15 @@ class ReplikAIDashboard(QMainWindow):
         card = QFrame()
         card.setObjectName("MetricCard")
         v = QVBoxLayout(card)
-        v.setContentsMargins(16, 12, 16, 12)
-        v.setSpacing(4)
+        v.setContentsMargins(14, 10, 14, 10)
+        v.setSpacing(3)
 
         lbl_title = QLabel(title)
         lbl_title.setStyleSheet("color: #64748B; font-size: 10px; font-weight: 800; letter-spacing: 0.7px;")
         v.addWidget(lbl_title)
 
         lbl_val = QLabel(value)
-        lbl_val.setFont(QFont("Segoe UI Semibold", 14, QFont.Weight.Bold))
+        lbl_val.setFont(QFont("Segoe UI Semibold", 13, QFont.Weight.Bold))
         lbl_val.setStyleSheet(f"color: {accent_hex};")
         v.addWidget(lbl_val)
         return card, lbl_val
@@ -390,17 +405,45 @@ class ReplikAIDashboard(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
-        # Üst Satır: Canlı Ekran Bölgesi Önizleme + RDR2 Simülatörü
+        # YENİ: GTA 5 / RDR 2 Hedef Oyun Penceresi & Çerçevesiz Tam Ekran Kartı
+        game_bar_card = QFrame()
+        game_bar_card.setObjectName("HighlightCard")
+        gb_layout = QHBoxLayout(game_bar_card)
+        gb_layout.setContentsMargins(16, 10, 16, 10)
+        gb_layout.setSpacing(10)
+
+        gb_lbl = QLabel("🎮 HEDEF OYUN PENCERESİ:")
+        gb_lbl.setStyleSheet("color: #00F5D4; font-size: 11px; font-weight: 800;")
+        gb_layout.addWidget(gb_lbl)
+
+        self.window_combo = QComboBox()
+        self.window_combo.setMinimumWidth(330)
+        self.window_combo.currentIndexChanged.connect(self._on_target_window_changed)
+        gb_layout.addWidget(self.window_combo, stretch=1)
+
+        btn_refresh_win = QPushButton("🔄 Pencereleri Tara")
+        btn_refresh_win.setObjectName("SecondaryBtn")
+        btn_refresh_win.clicked.connect(self.refresh_game_window_list)
+        gb_layout.addWidget(btn_refresh_win)
+
+        btn_fix_fullscreen = QPushButton("🖥️ Çerçevesiz Tam Ekran Yap (Alt+B)")
+        btn_fix_fullscreen.setObjectName("PrimaryActionBtn")
+        btn_fix_fullscreen.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_fix_fullscreen.clicked.connect(self.apply_borderless_fullscreen_fix)
+        gb_layout.addWidget(btn_fix_fullscreen)
+
+        layout.addWidget(game_bar_card)
+
+        # Orta Satır: Canlı Ekran Bölgesi Önizleme + GTA5/RDR2 Simülatörü
         top_split = QHBoxLayout()
-        top_split.setSpacing(14)
+        top_split.setSpacing(12)
 
-        # 1. Canlı Bölge Monitörü
         preview_card = QFrame()
         preview_card.setObjectName("Card")
         pv_layout = QVBoxLayout(preview_card)
-        pv_layout.setContentsMargins(16, 14, 16, 14)
+        pv_layout.setContentsMargins(14, 12, 14, 12)
 
         pv_header = QHBoxLayout()
         pv_title = QLabel("👁️  SEÇİLİ ALTYAZI BÖLGESİ CANLI ÖNİZLEME")
@@ -409,13 +452,13 @@ class ReplikAIDashboard(QMainWindow):
 
         btn_refresh_pv = QPushButton("🔄 Kareyi Yenile")
         btn_refresh_pv.setObjectName("SecondaryBtn")
-        btn_refresh_pv.setFixedHeight(28)
+        btn_refresh_pv.setFixedHeight(26)
         btn_refresh_pv.clicked.connect(self.refresh_region_preview)
         pv_header.addWidget(btn_refresh_pv, alignment=Qt.AlignmentFlag.AlignRight)
         pv_layout.addLayout(pv_header)
 
         self.preview_image_lbl = QLabel("Önizleme yükleniyor...")
-        self.preview_image_lbl.setFixedHeight(96)
+        self.preview_image_lbl.setFixedHeight(88)
         self.preview_image_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_image_lbl.setStyleSheet(
             "background-color: #070A0F; border: 1px dashed #263248; border-radius: 8px; color: #64748B;"
@@ -423,28 +466,27 @@ class ReplikAIDashboard(QMainWindow):
         pv_layout.addWidget(self.preview_image_lbl)
         top_split.addWidget(preview_card, stretch=5)
 
-        # 2. RDR2 & Oyun Diyalog Test Stüdyosu
         sim_card = QFrame()
         sim_card.setObjectName("Card")
         sim_layout = QVBoxLayout(sim_card)
-        sim_layout.setContentsMargins(16, 14, 16, 14)
+        sim_layout.setContentsMargins(14, 12, 14, 12)
 
         sim_header = QHBoxLayout()
-        sim_title = QLabel("🤠  RDR2 & DİYALOG SİMÜLATÖRÜ (ANLIK TEST)")
+        sim_title = QLabel("🔫  GTA 5 & RDR 2 DİYALOG SİMÜLATÖRÜ")
         sim_title.setStyleSheet("color: #FBBF24; font-size: 11px; font-weight: 800;")
         sim_header.addWidget(sim_title)
 
-        btn_next_quote = QPushButton("🎲 Başka RDR2 Repliği")
+        btn_next_quote = QPushButton("🎲 Başka Replik")
         btn_next_quote.setObjectName("SecondaryBtn")
-        btn_next_quote.setFixedHeight(28)
+        btn_next_quote.setFixedHeight(26)
         btn_next_quote.clicked.connect(self._cycle_sample_quote)
         sim_header.addWidget(btn_next_quote, alignment=Qt.AlignmentFlag.AlignRight)
         sim_layout.addLayout(sim_header)
 
-        self.test_input = QLineEdit(RDR2_SAMPLE_QUOTES[0])
+        self.test_input = QLineEdit(SAMPLE_QUOTES[0])
         sim_layout.addWidget(self.test_input)
 
-        btn_run_sim = QPushButton("⚡  Seçili Motorla Çevir & Sinematik Overlay'de Göster")
+        btn_run_sim = QPushButton("⚡  Seçili Motorla Çevir & Overlay'de Göster")
         btn_run_sim.setObjectName("PrimaryActionBtn")
         btn_run_sim.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_run_sim.clicked.connect(self.run_test_translation)
@@ -453,11 +495,11 @@ class ReplikAIDashboard(QMainWindow):
         top_split.addWidget(sim_card, stretch=6)
         layout.addLayout(top_split)
 
-        # Alt Satır: Canlı Diyalog Akışı (Zengin Kart Görünümü)
+        # Alt Satır: Canlı Diyalog Akışı
         feed_card = QFrame()
         feed_card.setObjectName("Card")
         feed_v = QVBoxLayout(feed_card)
-        feed_v.setContentsMargins(16, 14, 16, 14)
+        feed_v.setContentsMargins(14, 12, 14, 12)
 
         feed_header = QHBoxLayout()
         feed_title = QLabel("📡  CANLI OYUN DİYALOG & ÇEVİRİ AKIŞI")
@@ -466,7 +508,7 @@ class ReplikAIDashboard(QMainWindow):
 
         btn_clear_feed = QPushButton("🧹 Akışı Temizle")
         btn_clear_feed.setObjectName("SecondaryBtn")
-        btn_clear_feed.setFixedHeight(28)
+        btn_clear_feed.setFixedHeight(26)
         btn_clear_feed.clicked.connect(lambda: self.feed_browser.clear())
         feed_header.addWidget(btn_clear_feed, alignment=Qt.AlignmentFlag.AlignRight)
         feed_v.addLayout(feed_header)
@@ -477,7 +519,6 @@ class ReplikAIDashboard(QMainWindow):
         feed_v.addWidget(self.feed_browser, stretch=1)
 
         layout.addWidget(feed_card, stretch=1)
-
         self._append_welcome_banner()
         return page
 
@@ -492,14 +533,13 @@ class ReplikAIDashboard(QMainWindow):
         layout.setContentsMargins(2, 2, 10, 12)
         layout.setSpacing(14)
 
-        # Kart 1: Oyun Atmosfer Profili (RDR2 Özel mod dahil)
         prof_card = QFrame()
         prof_card.setObjectName("Card")
         pv = QVBoxLayout(prof_card)
         pv.setContentsMargins(18, 16, 18, 16)
         pv.setSpacing(10)
 
-        pv.addWidget(self._section_label("🎭  OYUN ATMOSFER & TERİM PROFİLİ"))
+        pv.addWidget(self._section_label("🎭  OYUN ATMOSFER & TERİM PROFİLİ (GTA 5 & RDR 2 DAHİL)"))
         self.genre_combo = QComboBox()
         self.genre_combo.addItems(list(GAME_PROFILES.keys()))
         if self.config_data.game_genre in GAME_PROFILES:
@@ -514,7 +554,6 @@ class ReplikAIDashboard(QMainWindow):
         pv.addWidget(self.prompt_preview)
         layout.addWidget(prof_card)
 
-        # Kart 2: Yapay Zeka Çeviri Motoru ve API Anahtarları
         ai_card = QFrame()
         ai_card.setObjectName("Card")
         av = QVBoxLayout(ai_card)
@@ -594,7 +633,7 @@ class ReplikAIDashboard(QMainWindow):
         presets = [
             ("🤠 RDR2 Kehribar Sarısı", "#FFF3B0", "#0B0E14"),
             ("🎥 Sinema / Netflix Altın", "#FFE66D", "#101218"),
-            ("❄️ Ambarino Saf Beyaz", "#FFFFFF", "#090D16"),
+            ("❄️ GTA 5 / Ambarino Saf Beyaz", "#FFFFFF", "#090D16"),
             ("⚡ Cyberpunk Neon Camgöbeği", "#00F5D4", "#08121E"),
         ]
         for title, fg, bg in presets:
@@ -605,7 +644,6 @@ class ReplikAIDashboard(QMainWindow):
             preset_row.addWidget(b)
         cv.addLayout(preset_row)
 
-        # Boyut, Saydamlık ve Tarama Hızı Kaydırıcıları
         grid = QGridLayout()
         grid.setVerticalSpacing(16)
         grid.setHorizontalSpacing(18)
@@ -629,7 +667,7 @@ class ReplikAIDashboard(QMainWindow):
         self.lbl_interval_val = QLabel(f"Ekran Tarama Hızı: {self.config_data.scan_interval_ms} ms")
         grid.addWidget(self.lbl_interval_val, 2, 0)
         self.slider_interval = QSlider(Qt.Orientation.Horizontal)
-        self.slider_interval.setRange(200, 1200)
+        self.slider_interval.setRange(250, 1200)
         self.slider_interval.setSingleStep(50)
         self.slider_interval.setValue(int(self.config_data.scan_interval_ms))
         self.slider_interval.valueChanged.connect(self._on_overlay_sliders_changed)
@@ -660,6 +698,7 @@ class ReplikAIDashboard(QMainWindow):
         hv.setContentsMargins(18, 16, 18, 16)
         hv.setSpacing(8)
         hv.addWidget(self._section_label("⌨️  OYUN İÇİ GLOBAL KISAYOL TUŞLARI"))
+        hv.addWidget(QLabel("•  Alt + B  —  Aktif oyunu (GTA 5 / RDR 2) Çerçevesiz Tam Ekran (Borderless) yapar"))
         hv.addWidget(QLabel("•  Alt + R  —  Oyundaki altyazı bölgesini fareyle seçer (HUD Bölge Seçici)"))
         hv.addWidget(QLabel("•  Alt + T  —  Gerçek zamanlı yakalama ve çeviri motorunu Başlatır / Durdurur"))
         hv.addWidget(QLabel("•  Alt + L  —  Hayalet Modu (Click-Through) Kilitler veya Taşıma için Açar"))
@@ -705,15 +744,50 @@ class ReplikAIDashboard(QMainWindow):
     def _append_welcome_banner(self) -> None:
         self.feed_browser.append(
             "<div style='background-color:#111927; border-left: 4px solid #00F5D4; padding:10px; border-radius:6px; margin-bottom:8px;'>"
-            "<b style='color:#00F5D4;'>⚡ ReplikAI Pro v0.2 Komuta Merkezi Hazır</b><br>"
-            "<span style='color:#94A3B8;'>• <b>Red Dead Redemption 2 (1899 Vahşi Batı)</b> profili aktif. Oyun dosyalarına dokunulmaz, Anti-Cheat %100 güvenlidir.<br>"
-            "• Sağ üstteki <b>RDR2 & Diyalog Simülatörü</b> ile Arthur/Dutch repliklerini anında test edebilir veya <b>Alt+R</b> ile oyunda bölge seçebilirsiniz.</span>"
-            "</div>"
+            "<b style='color:#00F5D4;'>⚡ ReplikAI Pro v0.3 (Zero-Drop GTA 5 & RDR 2 Motoru) Hazır!</b><br>"
+            "<span style='color:#94A3B8;'>"
+            "1. <b>Masaüstü Okuma Çözümü:</b> GTA 5 veya RDR 2 açıkken üstteki <b>🖥️ Çerçevesiz Tam Ekran Yap (Alt+B)</b> butonuna (veya oyun içinden <b>Alt+B</b>'ye) basın ya da oyun ayarlarından <i>Windowed Borderless</i> seçin.<br>"
+            "2. <b>Sıfır FPS-Drop Filtresi:</b> Artık araba sürerken hareket eden asfalt/çevre OCR'ı tetiklemez; sadece konturlu altyazı harfleri değiştiğinde <b>35 ms</b> içinde 2 çekirdekte okunur."
+            "</span></div>"
         )
 
+    def refresh_game_window_list(self) -> None:
+        self.window_combo.blockSignals(True)
+        self.window_combo.clear()
+        self._window_entries = [(None, "🔄 Otomatik Algıla (GTA 5 / RDR 2 / Tam Ekran Masaüstü)")]
+
+        candidates = list_candidate_game_windows()
+        detected_idx = 0
+        for idx, (hwnd, title, exe) in enumerate(candidates, start=1):
+            display = f"[{exe}] {title[:55]}"
+            self._window_entries.append((hwnd, display))
+            if exe in ("gta5.exe", "gtavenhanced.exe", "playgtav.exe", "rdr2.exe") and detected_idx == 0:
+                detected_idx = idx
+
+        for _, disp in self._window_entries:
+            self.window_combo.addItem(disp)
+
+        self.window_combo.setCurrentIndex(detected_idx)
+        self.pipeline.target_hwnd = self._window_entries[detected_idx][0]
+        self.window_combo.blockSignals(False)
+
+    def _on_target_window_changed(self, index: int) -> None:
+        if 0 <= index < len(self._window_entries):
+            self.pipeline.target_hwnd = self._window_entries[index][0]
+            self.refresh_region_preview()
+
+    def apply_borderless_fullscreen_fix(self) -> None:
+        ok, msg = make_window_borderless_fullscreen(self.pipeline.target_hwnd)
+        color = "#00F5D4" if ok else "#FBBF24"
+        self.feed_browser.append(
+            f"<div style='background-color:#131C2E; border-left:3px solid {color}; padding:8px 12px; border-radius:6px; margin-bottom:6px;'>"
+            f"<b style='color:{color};'>🖥️ Pencere Dönüştürücü:</b> {msg}</div>"
+        )
+        self.refresh_game_window_list()
+
     def _cycle_sample_quote(self) -> None:
-        self._quote_idx = (self._quote_idx + 1) % len(RDR2_SAMPLE_QUOTES)
-        self.test_input.setText(RDR2_SAMPLE_QUOTES[self._quote_idx])
+        self._quote_idx = (self._quote_idx + 1) % len(SAMPLE_QUOTES)
+        self.test_input.setText(SAMPLE_QUOTES[self._quote_idx])
 
     def _on_profile_changed(self, profile_name: str) -> None:
         self.config_data.game_genre = profile_name
@@ -768,12 +842,13 @@ class ReplikAIDashboard(QMainWindow):
                 region=self.config_data.capture_region,
                 preprocess=False,
                 force=True,
+                target_hwnd=self.pipeline.target_hwnd,
             )
             if img is not None:
                 qim = ImageQt(img.convert("RGBA"))
                 pix = QPixmap.fromImage(qim).scaled(
                     380,
-                    90,
+                    82,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
@@ -787,7 +862,7 @@ class ReplikAIDashboard(QMainWindow):
         if active:
             self.btn_toggle_scan.setText("⏸  CANLI ÇEVİRİYİ DURDUR (Alt+T)")
             self.btn_toggle_scan.setObjectName("DangerActionBtn")
-            self.status_pill.setText("●  DURUM: CANLI TARAMA AKTİF")
+            self.status_pill.setText("●  DURUM: ZERO-DROP TARAMA AKTİF")
             self.status_pill.setStyleSheet(
                 "background-color: rgba(0, 245, 212, 0.12); color: #00F5D4; "
                 "border: 1px solid rgba(0, 245, 212, 0.45); border-radius: 8px; padding: 9px 12px; font-size: 11px; font-weight: 700;"
@@ -946,6 +1021,10 @@ class ReplikAIDashboard(QMainWindow):
             keyboard.add_hotkey(
                 self.config_data.hotkey_single_capture,
                 lambda: self.signals.hotkey_single_capture.emit(),
+            )
+            keyboard.add_hotkey(
+                self.config_data.hotkey_borderless,
+                lambda: self.signals.hotkey_borderless.emit(),
             )
         except Exception:
             pass

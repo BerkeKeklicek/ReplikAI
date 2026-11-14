@@ -20,6 +20,7 @@ config.local.json
 data/cache.db
 data/cache.db-journal
 data/cache.db-wal
+data/models/
 logs/
 *.log
 

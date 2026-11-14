@@ -1,4 +1,4 @@
-"""Gerçek zamanlı Yakalama -> OCR -> Önbellek -> Yapay Zeka Çeviri iş hattı (Pipeline)."""
+"""Gerçek zamanlı Yakalama -> 3D Altyazı Filtresi -> Turbo OCR -> Önbellek -> AI Çeviri iş hattı."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Callable, Optional
 from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
 from replikai.core.capture import ScreenCapturer
+from replikai.core.game_window import auto_detect_running_game, set_process_gaming_friendly_priority
 from replikai.core.ocr_engine import OCREngine
 from replikai.core.translator import GameTranslator
 
@@ -24,7 +25,7 @@ class TranslationEvent:
 
 
 class TranslationPipeline:
-    """Arka planda çalışan, düşük gecikmeli ekran okuma ve çeviri yöneticisi."""
+    """Arka planda çalışan, sıfır FPS-drop odaklı ekran okuma ve çeviri yöneticisi."""
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class TranslationPipeline:
         self.cache = TranslationCache()
         self.translator = GameTranslator(config)
 
+        self.target_hwnd: Optional[int] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_ocr_text: str = ""
@@ -53,12 +55,17 @@ class TranslationPipeline:
     def start(self) -> None:
         if self._running:
             return
+        set_process_gaming_friendly_priority()
+        if not self.target_hwnd:
+            detected = auto_detect_running_game()
+            if detected:
+                self.target_hwnd = detected[0]
         self._running = True
         self.capturer.reset_state()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         if self.on_status:
-            self.on_status("Canlı Çeviri Aktif")
+            self.on_status("Canlı Çeviri Aktif (Sıfır-Drop Modu)")
 
     def stop(self) -> None:
         self._running = False
@@ -80,6 +87,7 @@ class TranslationPipeline:
             diff_threshold=self.config.pixel_diff_threshold,
             preprocess=self.config.preprocess_contrast,
             force=force,
+            target_hwnd=self.target_hwnd,
         )
         if img is None:
             return None
@@ -89,7 +97,7 @@ class TranslationPipeline:
         if not cleaned:
             return None
 
-        if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.91):
+        if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
             return None
 
         self._last_ocr_text = cleaned
@@ -139,11 +147,14 @@ class TranslationPipeline:
 
     def _loop(self) -> None:
         while self._running:
+            t_start = time.perf_counter()
             try:
                 with self._lock:
                     self.process_single_frame(force=False)
             except Exception as exc:
                 if self.on_status:
                     self.on_status(f"Hata: {exc}")
-            interval_sec = max(0.15, float(self.config.scan_interval_ms) / 1000.0)
-            time.sleep(interval_sec)
+            elapsed = time.perf_counter() - t_start
+            interval_sec = max(0.30, float(self.config.scan_interval_ms) / 1000.0)
+            sleep_for = max(0.10, interval_sec - elapsed)
+            time.sleep(sleep_for)

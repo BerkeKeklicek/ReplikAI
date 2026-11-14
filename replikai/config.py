@@ -10,6 +10,17 @@ from typing import Any, Dict
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.local.json"
 
 GAME_PROFILES: Dict[str, Dict[str, str]] = {
+    "Grand Theft Auto V (GTA 5 - Los Santos)": {
+        "genre": "Modern Suç, Sokak & Aksiyon Draması (GTA V)",
+        "style_guide": (
+            "GTA 5 Los Santos atmosferine uygun, sokak dilini, argo ve esprileri robotikleştirmeden "
+            "doğal ve akıcı bir Türkçeyle çevir. Michael, Franklin, Trevor, Lamar, Lester, Los Santos, "
+            "Vinewood, Blaine County, FIB, LSPD gibi özel isimleri koru. 'Homie/Dog' -> 'dostum/kanka', "
+            "'Cops/Heat' -> 'aynasızlar/polisler', 'Score/Heist' -> 'vurgun/soygun' gibi doğal karşılıklar kullan."
+        ),
+        "accent_color": "#2EC4B6",
+        "subtitle_color": "#FFFFFF",
+    },
     "Red Dead Redemption 2 (Vahşi Batı 1899)": {
         "genre": "1899 Vahşi Batı / Kanun Kaçağı Draması (Red Dead Redemption 2)",
         "style_guide": (
@@ -83,7 +94,7 @@ class AppConfig:
     capture_region: Dict[str, int] = field(
         default_factory=lambda: CaptureRegion().to_dict()
     )
-    scan_interval_ms: int = 400
+    scan_interval_ms: int = 550
     pixel_diff_threshold: float = 2.2
     preprocess_contrast: bool = True
 
@@ -92,7 +103,7 @@ class AppConfig:
     provider: str = "free_fast"
     source_lang: str = "Auto"
     target_lang: str = "Türkçe"
-    game_genre: str = "Red Dead Redemption 2 (Vahşi Batı 1899)"
+    game_genre: str = "Grand Theft Auto V (GTA 5 - Los Santos)"
 
     # API Anahtarları ve Model İsimleri (config.local.json içinde yerel tutulur)
     gemini_api_key: str = ""
@@ -117,6 +128,7 @@ class AppConfig:
     hotkey_select_region: str = "alt+r"
     hotkey_toggle_lock: str = "alt+l"
     hotkey_single_capture: str = "alt+c"
+    hotkey_borderless: str = "alt+b"
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "AppConfig":
