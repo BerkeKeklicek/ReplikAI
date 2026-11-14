@@ -46,15 +46,15 @@ class ScreenCapturer:
         b = rgb_arr[:, :, 2]
 
         # Parlak beyaz, sarı veya açık renkli altyazı pikselleri
-        white_text = (r > 180) & (g > 180) & (b > 175)
-        yellow_text = (r > 190) & (g > 160) & (b > 55)
+        white_text = (r > 175) & (g > 175) & (b > 170)
+        yellow_text = (r > 185) & (g > 155) & (b > 50)
         bright = (white_text | yellow_text).astype(np.uint8) * 255
 
-        # Altyazıların etrafındaki siyah kontur / gölge pikselleri
+        # Altyazıların etrafındaki siyah kontur, gölge veya yarı saydam video altyazı kutusu (YouTube/Sinematik)
         gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
-        dark_stroke = (gray < 82).astype(np.uint8) * 255
+        dark_stroke = (gray < 105).astype(np.uint8) * 255
 
-        # Sadece yakınında (5x5 komşulukta) koyu kontur/gölge bulunan parlak pikselleri tut
+        # Sadece yakınında (5x5 komşulukta) koyu kontur/gölge/kutu bulunan parlak pikselleri tut
         near_dark = cv2.dilate(dark_stroke, np.ones((5, 5), np.uint8), iterations=1)
         subtitle_mask = cv2.bitwise_and(bright, near_dark)
         return subtitle_mask

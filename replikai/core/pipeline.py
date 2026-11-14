@@ -134,10 +134,10 @@ class TranslationPipeline:
             target_hwnd=self.target_hwnd,
         )
 
-        # Ekranda altyazı kalmadıysa mevcut Türkçe altyazıyı otomatik gizle
+        # Ekranda uzun süre (>= 7 kare / ~3.2 saniye) hiç altyazı kalmadıysa Türkçe altyazıyı gizle
         if not force and not self.capturer.subtitle_currently_visible:
             self._empty_ticks += 1
-            if self._empty_ticks >= 2 and self._subtitle_shown:
+            if self._empty_ticks >= 7 and self._subtitle_shown:
                 self._subtitle_shown = False
                 self._last_ocr_text = ""
                 if self.on_clear:
@@ -159,9 +159,6 @@ class TranslationPipeline:
         if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.86):
             return None
 
-        self._last_ocr_text = cleaned
-        self._subtitle_shown = True
-
         # 1. Önbellek kontrolü (0ms)
         cached = self.cache.get(
             cleaned,
@@ -169,6 +166,10 @@ class TranslationPipeline:
             genre=self.config.game_genre,
         )
         if cached:
+            if not force and is_similar_text(cleaned, cached, threshold=0.84):
+                return None
+            self._last_ocr_text = cleaned
+            self._subtitle_shown = True
             latency = (time.perf_counter() - t0) * 1000.0
             event = TranslationEvent(
                 source_text=cleaned,
@@ -189,6 +190,13 @@ class TranslationPipeline:
         tr_ms = (time.perf_counter() - t_tr_start) * 1000.0
         if not translated:
             return None
+
+        # Eğer çeviri orijinal metinle aynıysa (zaten Türkçe veya özel isimse) ekrana basma
+        if not force and is_similar_text(cleaned, translated, threshold=0.84):
+            return None
+
+        self._last_ocr_text = cleaned
+        self._subtitle_shown = True
 
         self.cache.set(
             source_text=cleaned,

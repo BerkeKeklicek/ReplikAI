@@ -1,4 +1,4 @@
-"""SQLite + Bellek içi (LRU) sıfır gecikmeli çeviri önbelleği."""
+"""SQLite + Bellek içi (LRU) sıfır gecikmeli çeviri önbelleği ve Akıllı Altyazı Süzgeci."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from typing import Dict, List, Optional, Tuple
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "cache.db"
 
-
 DESKTOP_NOISE_PATTERNS = (
     "obs studio",
     "visual studio",
@@ -27,30 +26,65 @@ DESKTOP_NOISE_PATTERNS = (
     "hayalet mod",
     "taşıma modu",
     "tasima modu",
+    "markdown kaynak",
+    "larkdown kaynak",
+    "yeniden yaptim",
+    "yeniden yaptım",
+    "yemekteyiz",
 )
+
+# Sadece Türkçede bulunan harfler (ekrandaki Türkçe metinleri tekrar çevirmemek için)
+TURKISH_SPECIFIC_CHARS = set("ğĞşŞıİ")
+TURKISH_COMMON_WORDS = {
+    "bir", "için", "icin", "olan", "olarak", "değil", "degil", "बहुत",
+    "yeni", "kaynak", "bayt", "oyun", "oyunu", "bolge", "bölge", "çeviri",
+    "ceviri", "lütfen", "lutfen", "evet", "hayır", "hayir", "tamam",
+}
 
 
 def normalize_ocr_text(text: str) -> str:
-    """OCR gürültüsünü temizler ve anlamlı oyun metnini normalize eder."""
+    """
+    OCR gürültüsünü temizler, yapışık kelimeleri ('AGood' -> 'A Good') onarır,
+    masaüstü ikonlarını ve zaten Türkçe olan yazıları filtreler.
+    """
     if not text:
         return ""
     cleaned = re.sub(r"[\r\n\t]+", " ", text)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    # Sadece noktalama veya tek karakterli gürültüleri ele
+    # Küçük harften hemen sonra gelen büyük harfi ayır ("returnTo" / "AGood" -> "A Good")
+    cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" _|~`^•·")
+
     alpha_count = sum(1 for ch in cleaned if ch.isalpha())
-    if alpha_count < 3:
+    if alpha_count < 4:
         return ""
+
+    # Zaten Türkçe özel harfler içeriyorsa çevirme
+    if any(ch in TURKISH_SPECIFIC_CHARS for ch in cleaned):
+        return ""
+
     low = cleaned.lower()
     for pat in DESKTOP_NOISE_PATTERNS:
         if pat in low:
             return ""
+
+    words = re.findall(r"[a-zA-ZçğıöşüÇĞİÖŞÜ']+", low)
+    if not words:
+        return ""
+
+    # Tek kelimelik kısa gürültüleri ele (en az 2 kelime veya >=6 harfli anlamlı ifade olmalı)
+    if len(words) == 1 and len(words[0]) < 6:
+        return ""
+
+    if any(w in TURKISH_COMMON_WORDS for w in words):
+        return ""
+
     return cleaned
 
 
 def is_similar_text(a: str, b: str, threshold: float = 0.90) -> bool:
-    """İki OCR okuması arasındaki benzerliği ölçer (küçük OCR titremelerini yoksaymak için)."""
-    na = normalize_ocr_text(a).lower()
-    nb = normalize_ocr_text(b).lower()
+    """İki OCR okuması arasındaki benzerliği ölçer."""
+    na = re.sub(r"\s+", " ", (a or "")).strip().lower()
+    nb = re.sub(r"\s+", " ", (b or "")).strip().lower()
     if not na or not nb:
         return na == nb
     if na == nb:
@@ -89,7 +123,7 @@ class TranslationCache:
 
     @staticmethod
     def _make_key(source_text: str, target_lang: str, genre: str) -> str:
-        norm = normalize_ocr_text(source_text).lower()
+        norm = source_text.strip().lower()
         raw = f"{norm}||{target_lang.lower()}||{genre.lower()}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 

@@ -16,6 +16,10 @@ from replikai.core.translator import GameTranslator
 def test_normalize_and_similarity() -> None:
     assert normalize_ocr_text("  Hello\n\nworld!  ") == "Hello world!"
     assert normalize_ocr_text("...") == ""
+    # Zaten Türkçe olan veya masaüstü ikonu olan metinler filtrelenmeli
+    assert normalize_ocr_text("Oyunlarını Yeniden Yaptım") == ""
+    assert normalize_ocr_text("OBS Studio Visual Studio") == ""
+    assert normalize_ocr_text("Yeni") == ""
     assert is_similar_text("The gate is locked.", "The gate is locked!")
     assert not is_similar_text("The gate is locked.", "Open your inventory now.")
 

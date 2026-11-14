@@ -1,14 +1,15 @@
-"""Qt6 Birleşik Otomatik Altyazı Katmanı (Sessizken %100 Görünmez + DPI Uyumlu Ortak Bölge)."""
+"""Qt6 Tam Ekran Video & Oyun Üstü Birleşik Altyazı Katmanı (DWM DirectFlip Korumalı + HWND_TOPMOST)."""
 
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import sys
 from typing import Callable, Dict, Optional
 
 from PySide6.QtCore import QPoint, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QMouseEvent, QPainter, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QVBoxLayout, QLabel, QWidget
 
 from replikai.config import AppConfig
 from replikai.core.game_window import exclude_window_from_capture
@@ -17,16 +18,23 @@ GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
-WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
+
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
 
 
 class SubtitleOverlay(QWidget):
     """
-    Birleşik Otomatik Altyazı Katmanı:
-    1. Okuma alanı ile altyazı gösterme alanı BİRE BİR AYNI kutudur (farklı yeri okumaz!).
-    2. Windows %125 / %150 DPI ölçeklendirmesini otomatik hesaplar (`devicePixelRatio`).
-    3. Oyunda kimse konuşmuyorken (altyazı yokken) ekranda HİÇBİR DİKDÖRTGEN GÖSTERMEZ (%100 görünmezdir).
-    4. Konuşma bittiğinde veya 5.5 saniye sonra altyazıyı otomatik gizler.
+    Tam Ekran Video (YouTube, Netflix, VLC) ve Oyunlarda Kapanmayan Birleşik Altyazı Katmanı:
+    1. DWM DirectFlip Koruması: Tam ekran videolarda Windows'un katmanı arkaya atmaması için
+       1x1 görünmez (alpha=1) piksel ile DWM kompozisyonunu canlı tutar.
+    2. Her 500ms'de bir ve her yeni altyazıda `SetWindowPos(HWND_TOPMOST)` çağırarak tam ekran
+       tarayıcı/oyun pencerelerinin her zaman üstünde kalır.
+    3. Win32 `GetWindowRect` ile fiziksel ekran koordinatlarını doğrudan işletim sisteminden alır.
     """
 
     def __init__(
@@ -40,33 +48,57 @@ class SubtitleOverlay(QWidget):
         self._drag_offset: Optional[QPoint] = None
         self._has_active_text: bool = False
 
+        # Tool bayrağını kullanmıyoruz ki tam ekran videoların (Chrome/Edge Fullscreen) üstüne çıkabilsin
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
-        # Konuşma bittiğinde altyazıyı otomatik temizleyen zamanlayıcı
+        # Konuşma bittiğinde altyazıyı otomatik temizleyen zamanlayıcı (7 saniye)
         self._auto_hide_timer = QTimer(self)
         self._auto_hide_timer.setSingleShot(True)
         self._auto_hide_timer.timeout.connect(self.clear_subtitle)
+
+        # Tam ekran video veya oyun açıldığında Z-Order'da en üstte kalmayı garantileyen zamanlayıcı
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.timeout.connect(self.ensure_topmost)
+        self._topmost_timer.start(500)
 
         self._build_layout()
         self.sync_geometry_from_config()
         self.show()
         exclude_window_from_capture(int(self.winId()))
         self.apply_config()
+        self.ensure_topmost()
 
     @staticmethod
     def get_dpr() -> float:
         screen = QGuiApplication.primaryScreen()
         return float(screen.devicePixelRatio()) if screen else 1.0
 
+    def ensure_topmost(self) -> None:
+        """Tam ekran YouTube videosu veya oyun açıldığında overlay'i tekrar en üst katmana taşır."""
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = int(self.winId())
+            ctypes.windll.user32.SetWindowPos(
+                wintypes.HWND(hwnd),
+                wintypes.HWND(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        except Exception:
+            pass
+
     def sync_geometry_from_config(self) -> None:
-        """Fiziksel ekran piksellerini (`1920x1080`) Qt mantıksal koordinatlarına (`1536x864` @ %125 DPI) çevirir."""
+        """Fiziksel ekran piksellerini (`1920x1080`) Qt koordinatlarına çevirir."""
         dpr = self.get_dpr()
         reg = self.config.capture_region
         lx = int(round(reg.get("left", 260) / dpr))
@@ -76,7 +108,25 @@ class SubtitleOverlay(QWidget):
         self.setGeometry(lx, ly, lw, lh)
 
     def _save_geometry_to_config(self) -> None:
-        """Kullanıcı kutuyu taşıdığında okuma bölgesini (capture_region) kutunun yeni yerine eşitler!"""
+        """Kullanıcı kutuyu taşıdığında doğrudan Win32 fiziksel ekran koordinatlarını kaydeder."""
+        if sys.platform == "win32":
+            try:
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(wintypes.HWND(int(self.winId())), ctypes.byref(rect)):
+                    new_region = {
+                        "left": max(0, int(rect.left)),
+                        "top": max(0, int(rect.top)),
+                        "width": max(120, int(rect.right - rect.left)),
+                        "height": max(50, int(rect.bottom - rect.top)),
+                    }
+                    self.config.capture_region = new_region
+                    self.config.save()
+                    if self.on_region_moved:
+                        self.on_region_moved(new_region)
+                    return
+            except Exception:
+                pass
+
         dpr = self.get_dpr()
         geom = self.geometry()
         new_region = {
@@ -95,7 +145,6 @@ class SubtitleOverlay(QWidget):
         root.setContentsMargins(20, 8, 20, 12)
         root.setSpacing(2)
 
-        # Sadece "Konum Ayarlama Modu (Kilitsiz)" açıkken görünen rehber başlığı
         self.guide_label = QLabel(
             "🎯 OTOMATİK ALTYAZI BÖLGESİ — Bu çerçevenin içindeki altyazılar okunur ve burada gösterilir (Taşıyıp Alt+L ile kilitleyin)"
         )
@@ -116,23 +165,25 @@ class SubtitleOverlay(QWidget):
         root.addWidget(self.translated_label, stretch=1)
 
     def paintEvent(self, _event) -> None:
-        # Kilitli (Oyun) modundayken ve ekranda aktif altyazı yokken HİÇBİR ŞEY ÇİZME (%100 Görünmez!)
-        if self.config.overlay_click_through and not self._has_active_text:
-            return
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Kilitli moddayken ve ekranda aktif altyazı yokken:
+        # Gözle görünmez 1x1 piksel (alpha=1) çiz ki Windows DWM tam ekran videoda pencereyi kapatmasın!
+        if self.config.overlay_click_through and not self._has_active_text:
+            painter.fillRect(0, 0, 1, 1, QColor(0, 0, 0, 1))
+            return
+
         rect = self.rect().adjusted(2, 2, -2, -2)
 
         if not self.config.overlay_click_through:
-            # Konum/Bölge Ayarlama Modu: Neon vizör çerçevesi göster
-            painter.setBrush(QColor(11, 15, 25, 180))
+            painter.setBrush(QColor(11, 15, 25, 185))
             painter.setPen(QPen(QColor("#00F5D4"), 2.0, Qt.PenStyle.DashLine))
             painter.drawRoundedRect(rect, 12, 12)
             return
 
-        # Aktif Altyazı Varken: Sadece yazının arkasında yumuşak sinematik bant çiz
-        alpha = int(max(0.25, min(1.0, float(self.config.overlay_opacity))) * 215)
+        # Aktif Altyazı Varken: Sadece yazının arkasında sinematik yarı saydam bant çiz
+        alpha = int(max(0.25, min(1.0, float(self.config.overlay_opacity))) * 220)
         bg = QColor(self.config.overlay_bg_color)
         bg.setAlpha(alpha)
         painter.setBrush(bg)
@@ -145,7 +196,7 @@ class SubtitleOverlay(QWidget):
 
         if not enabled:
             if not self._has_active_text:
-                self.translated_label.setText("Altyazı Alanını Oyundaki Altyazının Üzerine Sürükleyin")
+                self.translated_label.setText("Altyazı Alanını Oyundaki / Videodaki Altyazının Üzerine Sürükleyin")
                 self.translated_label.setVisible(True)
         else:
             if not self._has_active_text:
@@ -158,12 +209,13 @@ class SubtitleOverlay(QWidget):
                 hwnd = int(self.winId())
                 exclude_window_from_capture(hwnd)
                 style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                base_style = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+                base_style = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST
                 if enabled:
                     new_style = base_style | WS_EX_TRANSPARENT
                 else:
                     new_style = base_style & ~WS_EX_TRANSPARENT
                 ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+                self.ensure_topmost()
             except Exception:
                 pass
         self.update()
@@ -191,7 +243,6 @@ class SubtitleOverlay(QWidget):
     ) -> None:
         cleaned_tr = (translated or "").strip()
         if not cleaned_tr:
-            self.clear_subtitle()
             return
 
         self._has_active_text = True
@@ -203,12 +254,13 @@ class SubtitleOverlay(QWidget):
 
         self.translated_label.setText(cleaned_tr)
         self.translated_label.setVisible(True)
-        # 5.5 saniye yeni altyazı gelmezse ekrandan otomatik kaldır
-        self._auto_hide_timer.start(5500)
+        self.ensure_topmost()
+        # 7 saniye boyunca yeni altyazı gelmezse ekrandan otomatik kaldır
+        self._auto_hide_timer.start(7000)
         self.update()
 
     def clear_subtitle(self) -> None:
-        """Konuşma bittiğinde ekrandaki altyazı kutusunu tamamen gizler."""
+        """Konuşma bittiğinde ekrandaki altyazı kutusunu gizler."""
         self._has_active_text = False
         self.source_label.setText("")
         self.source_label.setVisible(False)
@@ -216,7 +268,7 @@ class SubtitleOverlay(QWidget):
             self.translated_label.setText("")
             self.translated_label.setVisible(False)
         else:
-            self.translated_label.setText("Altyazı Alanını Oyundaki Altyazının Üzerine Sürükleyin")
+            self.translated_label.setText("Altyazı Alanını Oyundaki / Videodaki Altyazının Üzerine Sürükleyin")
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
