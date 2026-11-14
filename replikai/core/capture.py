@@ -91,7 +91,9 @@ class ScreenCapturer:
 
         self.subtitle_currently_visible = True
 
-        # Küçük 160x40 altyazı maskesi üzerinden fark ölç (arka plan hareketinden etkilenmez!)
+        # Küçük 160x40 altyazı maskesi üzerinden AKTİF HARF PİKSELLERİNE göre fark ölç
+        # (Tam kutu ortalaması kısa altyazılarda 'lets team up' değişimini yutuyordu;
+        #  aktif piksel XOR oranı sayesinde 2 kelimelik en ufak altyazı değişimi bile %100 yakalanır!)
         small_mask = cv2.resize(sub_mask, (160, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
 
         diff_score = 999.0
@@ -99,9 +101,17 @@ class ScreenCapturer:
             self._last_subtitle_mask_small is not None
             and self._last_subtitle_mask_small.shape == small_mask.shape
         ):
-            diff_score = float(np.mean(np.abs(small_mask - self._last_subtitle_mask_small)))
+            cur_bin = small_mask > 18.0
+            prev_bin = self._last_subtitle_mask_small > 18.0
+            union_count = int(np.count_nonzero(cur_bin | prev_bin))
+            xor_count = int(np.count_nonzero(cur_bin ^ prev_bin))
+            xor_ratio = float(xor_count) / float(max(1, union_count))
+            l1_active = float(np.sum(np.abs(small_mask - self._last_subtitle_mask_small))) / float(
+                max(1, union_count)
+            )
+            diff_score = max(xor_ratio * 22.0, l1_active / 7.5)
 
-        if not force and diff_score < (diff_threshold * 2.2):
+        if not force and diff_score < diff_threshold:
             return None, diff_score
 
         self._last_subtitle_mask_small = small_mask

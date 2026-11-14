@@ -14,6 +14,7 @@ import logging
 import threading
 from typing import Deque, Optional, Tuple
 import requests
+from requests.adapters import HTTPAdapter
 
 from replikai.config import AppConfig, GAME_PROFILES
 from replikai.core.cache import normalize_ocr_text
@@ -29,7 +30,15 @@ class GameTranslator:
         self._context_history: Deque[Tuple[str, str]] = deque(maxlen=4)
         self._lock = threading.Lock()
         self._session = requests.Session()
-        self._session.headers.update({"Connection": "keep-alive"})
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=1)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._session.headers.update(
+            {
+                "Connection": "keep-alive",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            }
+        )
 
     def warmup(self) -> None:
         """HTTPS TLS 1.3 oturumunu arka planda önceden açarak ilk çeviri gecikmesini ~85ms seviyesine indirir."""
@@ -62,17 +71,18 @@ class GameTranslator:
             f"Oyun Profili: {genre}. Hedef Dil: {target}.\n"
             f"Üslup Rehberi: {style_guide}\n"
             f"Kurallar:\n"
-            f"1. Ekrandan OCR ile okunan oyun altyazısını veya menü metnini {target} diline çevir.\n"
-            f"2. Kelime kelime robotik çeviri yapma; karakterin duygu durumunu, oyun atmosferini ve doğal {target} deyimlerini kullan.\n"
-            f"3. Özel karakter/yer/eşya isimlerini bozma, OCR kaynaklı ufak harf hatalarını bağlamdan onar.\n"
-            f"4. SADECE çevrilmiş metni döndür. Açıklama, tırnak işareti veya ek yorum YAZMA."
+            f"1. Ekrandan OCR ile okunan yabancı dildeki (Türkçe HARİÇ herhangi bir dildeki) altyazıyı {target} diline çevir.\n"
+            f"2. Eğer girdi zaten Türkçe ise HİÇBİR ŞEY çevirme, sadece SKIP_TR döndür.\n"
+            f"3. Kelime kelime robotik çeviri yapma; karakterin duygu durumunu, oyun atmosferini ve doğal {target} deyimlerini kullan.\n"
+            f"4. Özel karakter/yer/eşya isimlerini bozma, OCR kaynaklı ufak harf hatalarını bağlamdan onar.\n"
+            f"5. SADECE çevrilmiş metni döndür. Açıklama, tırnak işareti veya ek yorum YAZMA."
             f"{history_block}"
         )
 
     def translate(self, text: str) -> Tuple[str, str]:
         """
         Metni seçili sağlayıcı ile çevirir.
-        Dönüş: `(cevrilmis_metin, kullanilan_motor_adi)`
+        Kaynak metin Türkçe ise `("", "tr_ignored")` döndürerek Türkçeyi Türkçeye çevirmeyi engeller.
         """
         cleaned = normalize_ocr_text(text)
         if not cleaned:
@@ -83,31 +93,39 @@ class GameTranslator:
         try:
             if provider == "gemini" and self.config.gemini_api_key.strip():
                 result = self._translate_gemini(cleaned)
+                if result == "SKIP_TR":
+                    return "", "tr_ignored"
                 if result:
                     self._record_context(cleaned, result)
                     return result, f"Gemini ({self.config.gemini_model})"
 
             elif provider == "openai" and self.config.openai_api_key.strip():
                 result = self._translate_openai(cleaned)
+                if result == "SKIP_TR":
+                    return "", "tr_ignored"
                 if result:
                     self._record_context(cleaned, result)
                     return result, f"OpenAI ({self.config.openai_model})"
 
             elif provider == "ollama":
                 result = self._translate_ollama(cleaned)
+                if result == "SKIP_TR":
+                    return "", "tr_ignored"
                 if result:
                     self._record_context(cleaned, result)
                     return result, f"Ollama ({self.config.ollama_model})"
         except Exception as exc:
             logger.warning("%s motorunda hata oluştu, yedek motora geçiliyor: %s", provider, exc)
 
-        # Yedek veya varsayılan: Ücretsiz Hızlı Motor
+        # Yedek veya varsayılan: Ücretsiz Hızlı Motor (Otomatik Dil Algılamalı)
         fallback = self._translate_free_fast(cleaned)
+        if fallback == "__SKIP_TR__":
+            return "", "tr_ignored"
         if fallback:
             self._record_context(cleaned, fallback)
             return fallback, "Hızlı Çeviri (Ücretsiz)"
 
-        return cleaned, "Hata"
+        return "", "Hata"
 
     def _record_context(self, source: str, translated: str) -> None:
         self._context_history.append((source, translated))
@@ -178,7 +196,7 @@ class GameTranslator:
         return out or None
 
     def _translate_free_fast(self, text: str) -> Optional[str]:
-        """Anahtarsız, sıfır kurulum gerektiren ücretsiz hızlı çeviri katmanı."""
+        """Anahtarsız, sıfır kurulum gerektiren ücretsiz hızlı çeviri katmanı (Türkçe hariç tüm dilleri Türkçeye çevirir)."""
         lang_map = {
             "Türkçe": "tr",
             "İngilizce": "en",
@@ -196,10 +214,17 @@ class GameTranslator:
             "q": text,
         }
         with self._lock:
-            resp = self._session.get(url, params=params, timeout=3)
+            resp = self._session.get(url, params=params, timeout=2.5)
         resp.raise_for_status()
         data = resp.json()
         if not data or not isinstance(data[0], list):
             return None
+
+        # Google GTX otomatik dil algılama kodu (data[2]):
+        # Eğer algılanan kaynak dil zaten hedef dil (ör. "tr" = Türkçe) ise ASLA çevirme!
+        detected_src = str(data[2]).strip().lower() if len(data) > 2 and data[2] else ""
+        if detected_src and (detected_src == tl or detected_src.startswith(f"{tl}-")):
+            return "__SKIP_TR__"
+
         translated_chunks = [chunk[0] for chunk in data[0] if chunk and chunk[0]]
         return "".join(translated_chunks).strip() or None

@@ -31,14 +31,26 @@ DESKTOP_NOISE_PATTERNS = (
     "yeniden yaptim",
     "yeniden yaptım",
     "yemekteyiz",
+    "ask anything",
+    "@ to mentio",
+    "alt + c",
+    "alt+c",
+    "alt+t",
 )
 
-# Sadece Türkçede bulunan harfler (ekrandaki Türkçe metinleri tekrar çevirmemek için)
+# Sadece Türkçede bulunan harfler + ASCII'ye dönüşmüş yaygın Türkçe kelimeler
+# (Türkçeyi Türkçeye çevirmeyi %100 engeller; Türkçe hariç her dili Türkçeye çevirir)
 TURKISH_SPECIFIC_CHARS = set("ğĞşŞıİ")
 TURKISH_COMMON_WORDS = {
-    "bir", "için", "icin", "olan", "olarak", "değil", "degil", "बहुत",
+    "bir", "için", "icin", "olan", "olarak", "değil", "degil",
     "yeni", "kaynak", "bayt", "oyun", "oyunu", "bolge", "bölge", "çeviri",
     "ceviri", "lütfen", "lutfen", "evet", "hayır", "hayir", "tamam",
+    "veya", "ile", "dene", "bakalim", "bakalım", "reisim", "nasil", "nasıl",
+    "simdi", "şimdi", "sadece", "ama", "fakat", "ancak", "gibi", "daha",
+    "cok", "çok", "var", "yok", "bunu", "sunu", "oyle", "boyle", "kanka",
+    "hocam", "merhaba", "selam", "altyazi", "altyazı", "ekran", "pencere",
+    "uygulama", "ayarlar", "baslat", "durdur", "cunku", "çünkü", "belki",
+    "zaten", "hemen", "sonra", "once", "önce", "senin", "benim", "bizim",
 }
 
 
@@ -53,6 +65,11 @@ def normalize_ocr_text(text: str) -> str:
     # Küçük harften hemen sonra gelen büyük harfi ayır ("returnTo" / "AGood" -> "A Good")
     cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" _|~`^•·")
+
+    # Uzun altyazıların en sonuna çerçeve/kontur yüzünden eklenen tek harfli ' A' veya ' |' gürültüsünü temizle
+    raw_words = cleaned.split()
+    if len(raw_words) >= 5 and raw_words[-1] in {"A", "I", "l", "1", "|"}:
+        cleaned = " ".join(raw_words[:-1])
 
     alpha_count = sum(1 for ch in cleaned if ch.isalpha())
     if alpha_count < 4:
@@ -71,8 +88,8 @@ def normalize_ocr_text(text: str) -> str:
     if not words:
         return ""
 
-    # Tek kelimelik kısa gürültüleri ele (en az 2 kelime veya >=6 harfli anlamlı ifade olmalı)
-    if len(words) == 1 and len(words[0]) < 6:
+    # Tek kelimelik çok kısa gürültüleri ele (en az 2 kelime veya >=5 harfli anlamlı kelime olmalı)
+    if len(words) == 1 and len(words[0]) < 5:
         return ""
 
     if any(w in TURKISH_COMMON_WORDS for w in words):

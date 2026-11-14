@@ -94,7 +94,7 @@ class AppConfig:
     capture_region: Dict[str, int] = field(
         default_factory=lambda: CaptureRegion().to_dict()
     )
-    scan_interval_ms: int = 550
+    scan_interval_ms: int = 220
     pixel_diff_threshold: float = 2.2
     preprocess_contrast: bool = True
 

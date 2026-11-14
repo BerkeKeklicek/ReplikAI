@@ -66,7 +66,7 @@ class OCREngine:
                         logger.warning("İngilizce OCR modeli indirilemedi: %s", dl_exc)
 
                 kwargs = {
-                    "intra_op_num_threads": 3,
+                    "intra_op_num_threads": 4,
                     "inter_op_num_threads": 1,
                     "det_limit_side_len": 480,
                 }
@@ -84,15 +84,15 @@ class OCREngine:
     def _slice_subtitle_lines(rgb_arr: np.ndarray) -> List[np.ndarray]:
         """
         Görüntüdeki altyazı satırlarını tespit eder ve CRNN'in maksimum doğrulukla (%99+)
-        okuyabilmesi için dikeyde harflere tam oturan (`y1-1 .. y2+2`) kırpımlar üretir.
+        okuyabilmesi için dikeyde harflere tam oturan (`y1-2 .. y2+3`) kırpımlar üretir.
         """
         h, w, _ = rgb_arr.shape
         sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr).copy()
 
-        # Geniş ekran yakalamalarında (YouTube/oyun) en sol ve en sağ %16'lık köşelerdeki
+        # Geniş ekran yakalamalarında (YouTube/oyun) en sol ve en sağ %15'lik köşelerdeki
         # video oynatıcı ikonlarını (play, 0:19/33:57 süre, ayarlar çarkı) maskeden temizle
         if w > 650:
-            margin_x = int(w * 0.16)
+            margin_x = int(w * 0.15)
             sub_mask[:, :margin_x] = 0
             sub_mask[:, w - margin_x :] = 0
 
@@ -110,26 +110,25 @@ class OCREngine:
             if is_active and start_y is None:
                 start_y = y
             elif not is_active and start_y is not None:
-                if (y - start_y) >= 7:
+                band_h = y - start_y
+                if 8 <= band_h <= 85:
                     raw_bands.append((start_y, y))
                 start_y = None
-        if start_y is not None and (h - start_y) >= 7:
+        if start_y is not None and 8 <= (h - start_y) <= 85:
             raw_bands.append((start_y, h))
 
-        # İki altyazı satırı birbirine yapışmasın diye dikey birleştirme yapma;
-        # doğrudan tespit edilen satır bantlarını kullan
         merged_bands: List[Tuple[int, int]] = list(raw_bands)
 
-        # En yoğun 3 altyazı satırını yukarıdan aşağıya sırayla al
-        if len(merged_bands) > 3:
+        # En yoğun 2 altyazı satırını yukarıdan aşağıya sırayla al (gereksiz ONNX çağrılarını önler)
+        if len(merged_bands) > 2:
             merged_bands.sort(key=lambda b: int(np.sum(sub_mask[b[0]:b[1], :] > 0)), reverse=True)
-            merged_bands = sorted(merged_bands[:3], key=lambda b: b[0])
+            merged_bands = sorted(merged_bands[:2], key=lambda b: b[0])
 
         crops: List[np.ndarray] = []
         for y1, y2 in merged_bands:
             band_mask = sub_mask[y1:y2, :]
-            # Satır içindeki kelimeleri 38px yatay kapatma ile bağla
-            closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 38), np.uint8))
+            # Satır içindeki kelimeleri 45px yatay kapatma ile bağla
+            closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 45), np.uint8))
             col_active = np.sum(closed_line > 0, axis=0) >= 2
 
             spans: List[Tuple[int, int]] = []
@@ -138,16 +137,16 @@ class OCREngine:
                 if val and sx is None:
                     sx = x
                 elif not val and sx is not None:
-                    if (x - sx) >= 16:
+                    if (x - sx) >= 12:
                         spans.append((sx, x))
                     sx = None
-            if sx is not None and (w - sx) >= 16:
+            if sx is not None and (w - sx) >= 12:
                 spans.append((sx, w))
 
-            # Aralarında <= 48px olan kelime bloklarını aynı cümlede tut
+            # Aralarında <= 95px olan kelime bloklarını aynı cümlede tut (virgül/boşluk sonrası kelimeler kesilmesin)
             merged_spans: List[Tuple[int, int]] = []
             for sx1, sx2 in spans:
-                if merged_spans and (sx1 - merged_spans[-1][1]) <= 48:
+                if merged_spans and (sx1 - merged_spans[-1][1]) <= 95:
                     merged_spans[-1] = (merged_spans[-1][0], sx2)
                 else:
                     merged_spans.append((sx1, sx2))
@@ -165,12 +164,12 @@ class OCREngine:
 
             exact_y1 = max(0, y1 + int(ys.min()) - 2)
             exact_y2 = min(h, y1 + int(ys.max()) + 3)
-            exact_x1 = max(0, best_x1 + int(xs.min()) - 4)
-            exact_x2 = min(w, best_x1 + int(xs.max()) + 5)
+            exact_x1 = max(0, best_x1 + int(xs.min()) - 5)
+            exact_x2 = min(w, best_x1 + int(xs.max()) + 6)
 
             crop = rgb_arr[exact_y1:exact_y2, exact_x1:exact_x2]
             ch, cw = crop.shape[:2]
-            if cw >= 18 and ch >= 8:
+            if cw >= 16 and ch >= 8:
                 crops.append(crop)
 
         return crops

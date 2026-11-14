@@ -60,6 +60,8 @@ class TranslationPipeline:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_ocr_text: str = ""
+        self._prev_clause_text: str = ""
+        self._prev_clause_time: float = 0.0
         self._empty_ticks: int = 0
         self._subtitle_shown: bool = False
         self._lock = threading.Lock()
@@ -134,12 +136,13 @@ class TranslationPipeline:
             target_hwnd=self.target_hwnd,
         )
 
-        # Ekranda uzun süre (>= 7 kare / ~3.2 saniye) hiç altyazı kalmadıysa Türkçe altyazıyı gizle
+        # Ekranda uzun süre (>= 12 kare / ~2.5 saniye) hiç altyazı kalmadıysa Türkçe altyazıyı gizle
         if not force and not self.capturer.subtitle_currently_visible:
             self._empty_ticks += 1
-            if self._empty_ticks >= 7 and self._subtitle_shown:
+            if self._empty_ticks >= 12 and self._subtitle_shown:
                 self._subtitle_shown = False
                 self._last_ocr_text = ""
+                self._prev_clause_text = ""
                 if self.on_clear:
                     self.on_clear()
             return None
@@ -155,24 +158,74 @@ class TranslationPipeline:
         if not cleaned:
             return None
 
+        # Kelime kelime ekrana zıplayan (pop-in animasyonlu) altyazılarda ("Whoever" -> "Whoever wins this")
+        # tek kelime yakalandıysa 75ms bekleyip cümlenin tamamlanıp tamamlanmadığını kontrol et
+        if not force and len(cleaned.split()) == 1:
+            time.sleep(0.075)
+            t0 = time.perf_counter()
+            img2, _ = self.capturer.capture_region(
+                region=self.config.capture_region,
+                diff_threshold=self.config.pixel_diff_threshold,
+                preprocess=self.config.preprocess_contrast,
+                force=True,
+                target_hwnd=self.target_hwnd,
+            )
+            if img2 is not None:
+                t_ocr2 = time.perf_counter()
+                cleaned2 = normalize_ocr_text(self.ocr.extract_text(img2))
+                if cleaned2 and len(cleaned2) > len(cleaned):
+                    cleaned = cleaned2
+                    ocr_ms = (time.perf_counter() - t_ocr2) * 1000.0
+
         self._empty_ticks = 0
-        if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.86):
+        if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
             return None
+
+        # Dinamik Kurgulu Cümle Birleştirici ("Whoever wins this" -> "let's team up"):
+        # Videolarda tek bir cümle iki ayrı altyazı kartına bölündüyse (< 3.4 sn içinde),
+        # ikinci yarı geldiğinde tam cümleyi ("Whoever wins this, let's team up") birleştirerek çevir!
+        now_ts = time.perf_counter()
+        query_text = cleaned
+        is_joined_clause = False
+        prev_clean = self._prev_clause_text.strip()
+        if (
+            prev_clean
+            and (0.10 <= (now_ts - self._prev_clause_time) <= 3.4)
+            and len(prev_clean) <= 52
+            and len(cleaned) <= 52
+            and not prev_clean.endswith((".", "!", "?"))
+        ):
+            prev_low = prev_clean.lower()
+            cur_low = cleaned.lower()
+            # Eğer yeni metin öncekinin kelime uzantısı değilse (ayrı bir ikinci kartsa) birleştir
+            if not cur_low.startswith(prev_low[: min(7, len(prev_low))]) and not prev_low.startswith(
+                cur_low[: min(7, len(cur_low))]
+            ):
+                query_text = f"{prev_clean.rstrip(',')}, {cleaned}"
+                is_joined_clause = True
+
+        # Gelecekteki yarım cümle devamı için mevcut kartı kaydet
+        self._last_ocr_text = cleaned
+        if is_joined_clause:
+            self._prev_clause_text = cleaned
+            self._prev_clause_time = now_ts
+        else:
+            self._prev_clause_text = cleaned
+            self._prev_clause_time = now_ts
 
         # 1. Önbellek kontrolü (0ms)
         cached = self.cache.get(
-            cleaned,
+            query_text,
             target_lang=self.config.target_lang,
             genre=self.config.game_genre,
         )
         if cached:
-            if not force and is_similar_text(cleaned, cached, threshold=0.84):
+            if not force and is_similar_text(query_text, cached, threshold=0.84):
                 return None
-            self._last_ocr_text = cleaned
             self._subtitle_shown = True
             latency = (time.perf_counter() - t0) * 1000.0
             event = TranslationEvent(
-                source_text=cleaned,
+                source_text=query_text,
                 translated_text=cached,
                 provider="SQLite Önbellek ⚡",
                 from_cache=True,
@@ -186,20 +239,19 @@ class TranslationPipeline:
 
         # 2. Yapay Zeka Çevirisi
         t_tr_start = time.perf_counter()
-        translated, provider_label = self.translator.translate(cleaned)
+        translated, provider_label = self.translator.translate(query_text)
         tr_ms = (time.perf_counter() - t_tr_start) * 1000.0
-        if not translated:
+        if not translated or provider_label == "tr_ignored":
             return None
 
         # Eğer çeviri orijinal metinle aynıysa (zaten Türkçe veya özel isimse) ekrana basma
-        if not force and is_similar_text(cleaned, translated, threshold=0.84):
+        if not force and is_similar_text(query_text, translated, threshold=0.84):
             return None
 
-        self._last_ocr_text = cleaned
         self._subtitle_shown = True
 
         self.cache.set(
-            source_text=cleaned,
+            source_text=query_text,
             translated_text=translated,
             provider=provider_label,
             target_lang=self.config.target_lang,
@@ -207,7 +259,7 @@ class TranslationPipeline:
         )
         latency = (time.perf_counter() - t0) * 1000.0
         event = TranslationEvent(
-            source_text=cleaned,
+            source_text=query_text,
             translated_text=translated,
             provider=provider_label,
             from_cache=False,
@@ -224,8 +276,10 @@ class TranslationPipeline:
         while self._running:
             t_start = time.perf_counter()
             tick_counter += 1
-            if tick_counter % 8 == 1:
+            if tick_counter % 15 == 1:
                 self._auto_prepare_game_window()
+            if tick_counter % 55 == 0:
+                threading.Thread(target=self.translator.warmup, daemon=True).start()
             try:
                 with self._lock:
                     self.process_single_frame(force=False)
@@ -233,6 +287,6 @@ class TranslationPipeline:
                 if self.on_status:
                     self.on_status(f"Hata: {exc}")
             elapsed = time.perf_counter() - t_start
-            interval_sec = max(0.30, float(self.config.scan_interval_ms) / 1000.0)
-            sleep_for = max(0.10, interval_sec - elapsed)
+            interval_sec = max(0.18, float(self.config.scan_interval_ms) / 1000.0)
+            sleep_for = max(0.05, interval_sec - elapsed)
             time.sleep(sleep_for)

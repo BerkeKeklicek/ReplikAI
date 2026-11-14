@@ -16,8 +16,9 @@ from replikai.core.translator import GameTranslator
 def test_normalize_and_similarity() -> None:
     assert normalize_ocr_text("  Hello\n\nworld!  ") == "Hello world!"
     assert normalize_ocr_text("...") == ""
-    # Zaten Türkçe olan veya masaüstü ikonu olan metinler filtrelenmeli
+    # Zaten Türkçe olan (ASCII'ye dönüşmüş bile olsa) veya masaüstü ikonu olan metinler filtrelenmeli
     assert normalize_ocr_text("Oyunlarını Yeniden Yaptım") == ""
+    assert normalize_ocr_text("T veya Alt + c ile dene bakalim reisim!") == ""
     assert normalize_ocr_text("OBS Studio Visual Studio") == ""
     assert normalize_ocr_text("Yeni") == ""
     assert is_similar_text("The gate is locked.", "The gate is locked!")
@@ -84,6 +85,15 @@ def test_translator_prompt_and_fallback() -> None:
     translated, provider = translator.translate("Stay awhile and listen!")
     assert len(translated) > 2
     assert provider != "none"
+
+    # Türkçe hariç her dili Türkçeye çevirmeli, Türkçeyi (ASCII olsa bile) çevirmemeli
+    tr_skip, tr_prov = translator.translate("Bugun hava harika gorunuyor")
+    assert tr_skip == ""
+    assert tr_prov == "tr_ignored"
+
+    es_tr, es_prov = translator.translate("Hola amigos, vamos a ganar")
+    assert len(es_tr) > 2
+    assert es_prov != "tr_ignored"
 
 
 def test_3d_background_subtitle_mask_filter() -> None:
