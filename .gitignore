@@ -23,7 +23,8 @@ data/cache.db-wal
 logs/
 *.log
 
-# IDE / OS files
+# IDE / OS / Test files
+.pytest_cache/
 .vscode/
 .idea/
 .DS_Store
