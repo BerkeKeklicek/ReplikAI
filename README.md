@@ -24,12 +24,13 @@ Avrupa ve Asya merkezli birçok oyun stüdyosu oyunlarına resmi Türkçe dil de
 
 | Özellik | Açıklama |
 | :--- | :--- |
-| **🎯 İnteraktif Bölge Seçici** | Fare ile ekranda altyazı veya diyalog kutusunun çıktığı alanı saniyeler içinde seçin (`Alt + R`). |
-| **🔍 Çift Katmanlı Hızlı OCR** | Windows yerleşik **WinRT Native OCR** (ekstra kurulum gerektirmez, ultra hızlı) ve **RapidOCR / Tesseract** desteği. |
-| **🤖 Çoklu AI Motoru** | **Google Gemini** (`gemini-2.5-flash`), **OpenAI** (`gpt-4o-mini`), **Yerel Ollama** (`llama3`, `gemma2`, `qwen2.5` - %100 ücretsiz & çevrimdışı) ve **Ücretsiz Hızlı Web Çeviri** yedek katmanı. |
-| **🎭 Oyun Türü & Karakter Tonu** | RPG, Bilim Kurgu, Korku, Orta Çağ veya Genel modlarıyla oyunun atmosferine uygun çeviri. |
-| **💾 Kalıcı SQLite Önbellek** | Çevrilen her replik yerel veritabanına kaydedilir; aynı diyalog veya menü tekrar açıldığında anında gösterilir. |
-| **🎨 Özelleştirilebilir Arayüz** | Yazı boyutu, arka plan saydamlığı, metin rengi ve hayalet mod (tıklama geçirgenliği) anlık ayarlanabilir. |
+| **🎯 Lazer HUD Bölge Seçici** | Neon köşe braketli ve piksel koordinat göstergeli tam ekran HUD ile altyazı alanını seçin (`Alt + R`). |
+| **👁️ Canlı Bölge Monitörü** | Seçtiğiniz ekran bölgesini doğrudan Komuta Merkezi içinden canlı önizleme olarak takip edin. |
+| **🔍 ONNX Yerel Hızlı OCR** | Harici kurulum gerektirmeyen **RapidOCR (ONNX Runtime)** ile oyun altyazılarını çevrimdışı ve yüksek hızda okur. |
+| **🤖 Çoklu AI Motoru** | **Google Gemini** (`gemini-2.5-flash`), **OpenAI** (`gpt-4o-mini`), **Yerel Ollama** (`gemma2`, `llama3`) ve **Ücretsiz Hızlı Motor** yedek katmanı. |
+| **🤠 Özel Oyun Profilleri (RDR2 vb.)** | **Red Dead Redemption 2 (1899 Vahşi Batı)**, **BG3/Witcher (Fantastik RPG)**, **Cyberpunk 2077** gibi özel terim ve dönem Türkçesi profilleri. |
+| **💾 Kalıcı SQLite Önbellek** | Çevrilen her replik yerel veritabanına kaydedilir; aynı diyalog veya menü tekrar açıldığında **0 ms** gecikmeyle gösterilir. |
+| **🎬 Qt6 Sinematik Hayalet Overlay** | Gerçek piksel bazlı saydamlık (`WA_TranslucentBackground`), sinema gölgeli fontlar ve `WS_EX_TRANSPARENT` tıklama geçirgenliği. |
 
 ---
 

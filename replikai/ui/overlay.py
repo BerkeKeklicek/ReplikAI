@@ -1,11 +1,20 @@
-"""Win32 Click-Through (Tıklama Geçirgen) destekli Hayalet Altyazı Katmanı (Ghost Overlay)."""
+"""Qt6 Sinematik Hayalet Altyazı Katmanı (Per-Pixel Alpha + Win32 Click-Through)."""
 
 from __future__ import annotations
 
 import ctypes
 import sys
-import tkinter as tk
 from typing import Optional
+
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QMouseEvent, QPainter, QPen
+from PySide6.QtWidgets import (
+    QGraphicsDropShadowEffect,
+    QHBoxLayout,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
 
 from replikai.config import AppConfig
 
@@ -14,139 +23,161 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 
 
-class SubtitleOverlay(tk.Toplevel):
-    """Oyunun üstünde duran, fare tıklamalarını engellemeyen Türkçe altyazı penceresi."""
+class SubtitleOverlay(QWidget):
+    """Oyunların üstünde çalışan, tıklama geçirgen (Ghost) sinematik altyazı katmanı."""
 
-    def __init__(self, master: tk.Misc, config: AppConfig) -> None:
-        super().__init__(master)
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__(None)
         self.config = config
+        self._drag_offset: Optional[QPoint] = None
 
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        self.attributes("-alpha", float(self.config.overlay_opacity))
-        self.configure(bg=self.config.overlay_bg_color)
-
-        # Başlangıç konumu: seçilen yakalama bölgesinin hemen altı veya ekranın alt ortası
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        width = min(1100, int(screen_w * 0.72))
-        height = 115
-        left = (screen_w - width) // 2
-        top = int(screen_h * 0.80)
-        self.geometry(f"{width}x{height}+{left}+{top}")
-
-        # İnce üst durum çubuğu (Kilidi açıkken sürüklemek için)
-        self.header_frame = tk.Frame(self, bg="#1E222D", height=20)
-        self.header_frame.pack(fill="x", side="top")
-
-        self.badge_label = tk.Label(
-            self.header_frame,
-            text="👻 ReplikAI Canlı Altyazı  |  Alt+L: Kilitle/Taşı  |  Alt+T: Başlat/Durdur",
-            fg="#8E9AAF",
-            bg="#1E222D",
-            font=("Segoe UI", 9, "bold"),
-            padx=10,
-             anchor="w",
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
-        self.badge_label.pack(fill="x", side="left")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
-        # Orijinal metin (opsiyonel küçük satır)
-        self.source_label = tk.Label(
-            self,
-            text="",
-            fg="#A0AAB8",
-            bg=self.config.overlay_bg_color,
-            font=("Segoe UI", max(10, int(self.config.overlay_font_size) - 6), "italic"),
-            wraplength=width - 40,
-            justify="center",
-        )
+        screen = QGuiApplication.primaryScreen()
+        scr_w, scr_h = (1920, 1080)
+        if screen:
+            g = screen.geometry()
+            scr_w, scr_h = g.width(), g.height()
 
-        # Ana Türkçe çeviri metni
-        self.translated_label = tk.Label(
-            self,
-            text="ReplikAI Hazır — Altyazı bölgesi seçip (Alt+R) çeviriyi başlatın (Alt+T)",
-            fg=self.config.overlay_text_color,
-            bg=self.config.overlay_bg_color,
-            font=("Segoe UI Semibold", int(self.config.overlay_font_size)),
-            wraplength=width - 40,
-            justify="center",
-            padx=16,
-            pady=8,
-        )
-        self.translated_label.pack(fill="both", expand=True)
+        width = min(1140, int(scr_w * 0.70))
+        height = 132
+        left = (scr_w - width) // 2
+        top = int(scr_h * 0.81)
+        self.setGeometry(left, top, width, height)
 
-        self._drag_x = 0
-        self._drag_y = 0
-        for widget in (self, self.header_frame, self.badge_label, self.translated_label):
-            widget.bind("<ButtonPress-1>", self._start_move)
-            widget.bind("<B1-Motion>", self._on_move)
-
-        self.update_idletasks()
+        self._build_layout()
+        self.show()
         self.apply_config()
 
-    def _start_move(self, event: tk.Event) -> None:
-        if self.config.overlay_click_through:
-            return
-        self._drag_x = event.x_root - self.winfo_x()
-        self._drag_y = event.y_root - self.winfo_y()
+    def _build_layout(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 10, 22, 14)
+        root.setSpacing(4)
 
-    def _on_move(self, event: tk.Event) -> None:
+        # Üst mini HUD barı
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        self.badge_label = QLabel("🔒 HAYALET MOD AKTİF  •  ALT+L: TAŞI / KİLİTLE")
+        self.badge_label.setFont(QFont("Segoe UI Semibold", 8))
+        self.badge_label.setStyleSheet("color: rgba(0, 245, 212, 190); background: transparent;")
+        top_row.addWidget(self.badge_label, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.engine_tag = QLabel("REPLIK AI PRO")
+        self.engine_tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.engine_tag.setStyleSheet("color: rgba(148, 163, 184, 150); background: transparent;")
+        top_row.addWidget(self.engine_tag, alignment=Qt.AlignmentFlag.AlignRight)
+
+        root.addLayout(top_row)
+
+        # Orijinal yabancı metin satırı
+        self.source_label = QLabel("")
+        self.source_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.source_label.setWordWrap(True)
+        self.source_label.setStyleSheet("color: rgba(203, 213, 225, 195); background: transparent;")
+        root.addWidget(self.source_label)
+
+        # Ana Türkçe Sinematik Altyazı
+        self.translated_label = QLabel(
+            "ReplikAI Pro Hazır — Oyundaki altyazı bölgesini seçin (Alt+R) ve çeviriyi başlatın (Alt+T)"
+        )
+        self.translated_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.translated_label.setWordWrap(True)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(14)
+        shadow.setColor(QColor(0, 0, 0, 240))
+        shadow.setOffset(0, 2)
+        self.translated_label.setGraphicsEffect(shadow)
+
+        root.addWidget(self.translated_label, stretch=1)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        alpha = int(max(0.25, min(1.0, float(self.config.overlay_opacity))) * 235)
+        bg = QColor(self.config.overlay_bg_color)
+        bg.setAlpha(alpha)
+
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        painter.setBrush(bg)
+
         if self.config.overlay_click_through:
-            return
-        new_x = event.x_root - self._drag_x
-        new_y = event.y_root - self._drag_y
-        self.geometry(f"+{new_x}+{new_y}")
+            painter.setPen(QPen(QColor(255, 255, 255, 28), 1.0))
+        else:
+            painter.setPen(QPen(QColor("#FFB703"), 2.0))
+
+        painter.drawRoundedRect(rect, 16, 16)
 
     def set_click_through(self, enabled: bool) -> None:
-        """Windows API üzerinden pencereyi fare tıklamalarına geçirgen (Ghost) yapar."""
         self.config.overlay_click_through = enabled
         if enabled:
-            self.badge_label.configure(
-                text="🔒 Hayalet Mod Aktif (Tıklamalar Oyuna Geçer)  |  Taşımak için: Alt+L",
-                fg="#00F5D4",
-            )
+            self.badge_label.setText("🔒 HAYALET MOD (TIKLAMALAR OYUNA GEÇER)  •  ALT+L")
+            self.badge_label.setStyleSheet("color: rgba(0, 245, 212, 175); background: transparent;")
         else:
-            self.badge_label.configure(
-                text="🔓 Taşıma Modu Açık (Sürükleyebilirsiniz)  |  Kilitlemek için: Alt+L",
-                fg="#FFD166",
-            )
+            self.badge_label.setText("🔓 TAŞIMA MODU AÇIK (FARE İLE SÜRÜKLEYİN)  •  ALT+L: KİLİTLE")
+            self.badge_label.setStyleSheet("color: #FFB703; background: transparent;")
 
-        if sys.platform != "win32":
-            return
-
-        try:
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            if not hwnd:
-                hwnd = self.winfo_id()
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if enabled:
-                new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT
-            else:
-                new_style = (style | WS_EX_LAYERED) & ~WS_EX_TRANSPARENT
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
-        except Exception:
-            pass
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if enabled:
+                    new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+                else:
+                    new_style = (style | WS_EX_LAYERED) & ~WS_EX_TRANSPARENT
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            except Exception:
+                pass
+        self.update()
 
     def apply_config(self) -> None:
-        self.attributes("-alpha", float(self.config.overlay_opacity))
-        self.configure(bg=self.config.overlay_bg_color)
-        self.translated_label.configure(
-            fg=self.config.overlay_text_color,
-            bg=self.config.overlay_bg_color,
-            font=("Segoe UI Semibold", int(self.config.overlay_font_size)),
+        font_sz = int(self.config.overlay_font_size)
+        self.translated_label.setFont(QFont("Segoe UI Semibold", font_sz))
+        self.translated_label.setStyleSheet(
+            f"color: {self.config.overlay_text_color}; background: transparent;"
         )
-        self.source_label.configure(
-            bg=self.config.overlay_bg_color,
-            font=("Segoe UI", max(10, int(self.config.overlay_font_size) - 6), "italic"),
-        )
-        if self.config.show_original_text:
-            self.source_label.pack(fill="x", side="top", padx=16, pady=(4, 0), before=self.translated_label)
-        else:
-            self.source_label.pack_forget()
-        self.set_click_through(self.config.overlay_click_through)
 
-    def update_subtitle(self, translated: str, original: Optional[str] = None) -> None:
+        orig_sz = max(10, font_sz - 7)
+        orig_font = QFont("Segoe UI", orig_sz)
+        orig_font.setItalic(True)
+        self.source_label.setFont(orig_font)
+        self.source_label.setVisible(bool(self.config.show_original_text))
+
+        self.set_click_through(bool(self.config.overlay_click_through))
+        self.update()
+
+    def update_subtitle(
+        self,
+        translated: str,
+        original: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> None:
         if self.config.show_original_text and original:
-            self.source_label.configure(text=original)
-        self.translated_label.configure(text=translated)
+            self.source_label.setText(original)
+            self.source_label.setVisible(True)
+        else:
+            self.source_label.setVisible(False)
+
+        if provider:
+            self.engine_tag.setText(provider.upper())
+
+        self.translated_label.setText(translated)
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if not self.config.overlay_click_through and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if not self.config.overlay_click_through and self._drag_offset is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+    def mouseReleaseEvent(self, _event: QMouseEvent) -> None:
+        self._drag_offset = None

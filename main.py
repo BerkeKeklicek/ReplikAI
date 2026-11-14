@@ -1,9 +1,11 @@
-"""ReplikAI — Uygulama Giriş Noktası."""
+"""ReplikAI Pro — Uygulama Giriş Noktası (Qt6 / PySide6)."""
 
 from __future__ import annotations
 
 import ctypes
 import sys
+
+from PySide6.QtWidgets import QApplication
 
 from replikai.ui.dashboard import ReplikAIDashboard
 
@@ -23,8 +25,11 @@ def enable_windows_dpi_awareness() -> None:
 
 def main() -> None:
     enable_windows_dpi_awareness()
-    app = ReplikAIDashboard()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    app.setApplicationName("ReplikAI Pro")
+    window = ReplikAIDashboard()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

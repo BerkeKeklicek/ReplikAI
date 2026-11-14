@@ -14,7 +14,7 @@ import logging
 from typing import Deque, Optional, Tuple
 import requests
 
-from replikai.config import AppConfig
+from replikai.config import AppConfig, GAME_PROFILES
 from replikai.core.cache import normalize_ocr_text
 
 logger = logging.getLogger(__name__)
@@ -25,11 +25,17 @@ class GameTranslator:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self._context_history: Deque[Tuple[str, str]] = deque(maxlen=3)
+        self._context_history: Deque[Tuple[str, str]] = deque(maxlen=4)
         self._session = requests.Session()
 
     def build_system_prompt(self) -> str:
-        genre = self.config.game_genre or "RPG / Hikaye Odaklı"
+        profile_name = self.config.game_genre or "Red Dead Redemption 2 (Vahşi Batı 1899)"
+        profile = GAME_PROFILES.get(profile_name, {})
+        genre = profile.get("genre", profile_name)
+        style_guide = profile.get(
+            "style_guide",
+            "Oyun atmosferine uygun, doğal ve akıcı bir Türkçe kullan.",
+        )
         target = self.config.target_lang or "Türkçe"
         history_block = ""
         if self._context_history:
@@ -37,8 +43,9 @@ class GameTranslator:
             history_block = "\nÖnceki Diyalog Bağlamı:\n" + "\n".join(lines)
 
         return (
-            f"Sen profesyonel bir video oyunu yerelleştirme (localization) uzmanısın. "
-            f"Oyun Türü: {genre}. Hedef Dil: {target}.\n"
+            f"Sen profesyonel bir AAA video oyunu yerelleştirme (localization) uzmanısın. "
+            f"Oyun Profili: {genre}. Hedef Dil: {target}.\n"
+            f"Üslup Rehberi: {style_guide}\n"
             f"Kurallar:\n"
             f"1. Ekrandan OCR ile okunan oyun altyazısını veya menü metnini {target} diline çevir.\n"
             f"2. Kelime kelime robotik çeviri yapma; karakterin duygu durumunu, oyun atmosferini ve doğal {target} deyimlerini kullan.\n"

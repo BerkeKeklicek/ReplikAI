@@ -1,93 +1,130 @@
-"""Tam ekran yarı saydam interaktif OCR altyazı bölgesi seçici."""
+"""Qt6 Tabanlı Profesyonel HUD Ekran Bölgesi Seçici (Crosshair + Boyut Göstergeli)."""
 
 from __future__ import annotations
 
-import tkinter as tk
 from typing import Callable, Dict, Optional
 
+from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeyEvent, QMouseEvent, QPainter, QPen
+from PySide6.QtWidgets import QWidget
 
-class RegionSelector(tk.Toplevel):
-    """Kullanıcının ekranda fareyle sürükleyerek altyazı alanını seçmesini sağlar."""
+
+class RegionSelector(QWidget):
+    """Oyun ekranında altyazı alanını milimetrik seçmek için tam ekran HUD katmanı."""
 
     def __init__(
         self,
-        master: tk.Misc,
         on_selected: Callable[[Dict[str, int]], None],
+        parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__(master)
+        super().__init__(parent)
         self.on_selected = on_selected
 
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        self.attributes("-alpha", 0.35)
-        self.configure(bg="#090B10", cursor="crosshair")
-
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        self.geometry(f"{screen_w}x{screen_h}+0+0")
-
-        self.canvas = tk.Canvas(
-            self,
-            bg="#090B10",
-            highlightthickness=0,
-            cursor="crosshair",
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
-        self.canvas.pack(fill="both", expand=True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
 
-        self.canvas.create_text(
-            screen_w // 2,
-            60,
-            text="🎯 Oyundaki altyazı bölgesini fareyle sürükleyerek seçin (İptal: ESC)",
-            fill="#00F5D4",
-            font=("Segoe UI", 16, "bold"),
-        )
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            geom = screen.geometry()
+            self.setGeometry(geom)
+        else:
+            self.showFullScreen()
 
-        self._start_x = 0
-        self._start_y = 0
-        self._rect_id: Optional[int] = None
+        self._start_pos: Optional[QPoint] = None
+        self._current_pos: Optional[QPoint] = None
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.bind("<Escape>", lambda _e: self.destroy())
-        self.focus_force()
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    def _on_press(self, event: tk.Event) -> None:
-        self._start_x = event.x_root
-        self._start_y = event.y_root
-        if self._rect_id:
-            self.canvas.delete(self._rect_id)
-        self._rect_id = self.canvas.create_rectangle(
-            self._start_x,
-            self._start_y,
-            self._start_x,
-            self._start_y,
-            outline="#00F5D4",
-            width=3,
-            fill="#14213D",
-            stipple="gray25",
+        # Yarı saydam koyu sinematik maske
+        painter.fillRect(self.rect(), QColor(7, 10, 16, 175))
+
+        # Üst bilgi rozeti
+        banner_rect = QRect((self.width() - 680) // 2, 36, 680, 48)
+        painter.setPen(QPen(QColor(0, 245, 212, 180), 1.5))
+        painter.setBrush(QColor(15, 20, 32, 230))
+        painter.drawRoundedRect(banner_rect, 12, 12)
+
+        painter.setPen(QColor("#F8FAFC"))
+        painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        painter.drawText(
+            banner_rect,
+            Qt.AlignmentFlag.AlignCenter,
+            "🎯 Oyundaki Altyazı Alanını Fareyle Sürükleyerek Seçin   •   İptal: ESC",
         )
 
-    def _on_drag(self, event: tk.Event) -> None:
-        if self._rect_id:
-            self.canvas.coords(
-                self._rect_id,
-                self._start_x,
-                self._start_y,
-                event.x_root,
-                event.y_root,
-            )
+        if self._start_pos and self._current_pos:
+            sel_rect = QRect(self._start_pos, self._current_pos).normalized()
 
-    def _on_release(self, event: tk.Event) -> None:
-        x1, y1 = min(self._start_x, event.x_root), min(self._start_y, event.y_root)
-        x2, y2 = max(self._start_x, event.x_root), max(self._start_y, event.y_root)
-        width = max(80, x2 - x1)
-        height = max(40, y2 - y1)
-        region = {
-            "left": int(x1),
-            "top": int(y1),
-            "width": int(width),
-            "height": int(height),
-        }
-        self.destroy()
-        self.on_selected(region)
+            # Seçilen alanı şeffaflaştır (oyun net görünsün)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillRect(sel_rect, Qt.GlobalColor.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+            # İnce neon çerçeve
+            painter.setPen(QPen(QColor(0, 245, 212, 220), 2, Qt.PenStyle.SolidLine))
+            painter.setBrush(QColor(0, 245, 212, 18))
+            painter.drawRect(sel_rect)
+
+            # Köşe L-braketleri (HUD görünümü)
+            corner_len = 16
+            painter.setPen(QPen(QColor("#FFE66D"), 3.5))
+            x1, y1, x2, y2 = sel_rect.left(), sel_rect.top(), sel_rect.right(), sel_rect.bottom()
+            # Sol-Üst
+            painter.drawLine(x1, y1, x1 + corner_len, y1)
+            painter.drawLine(x1, y1, x1, y1 + corner_len)
+            # Sağ-Üst
+            painter.drawLine(x2, y1, x2 - corner_len, y1)
+            painter.drawLine(x2, y1, x2, y1 + corner_len)
+            # Sol-Alt
+            painter.drawLine(x1, y2, x1 + corner_len, y2)
+            painter.drawLine(x1, y2, x1, y2 - corner_len)
+            # Sağ-Alt
+            painter.drawLine(x2, y2, x2 - corner_len, y2)
+            painter.drawLine(x2, y2, x2, y2 - corner_len)
+
+            # Boyut etiketi
+            dim_text = f"{sel_rect.width()} × {sel_rect.height()} px  ({sel_rect.x()}, {sel_rect.y()})"
+            tag_rect = QRect(sel_rect.left(), max(8, sel_rect.top() - 32), 230, 26)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(13, 18, 28, 235))
+            painter.drawRoundedRect(tag_rect, 6, 6)
+            painter.setPen(QColor("#00F5D4"))
+            painter.setFont(QFont("Segoe UI Semibold", 9))
+            painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, dim_text)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._start_pos = event.globalPosition().toPoint()
+            self._current_pos = self._start_pos
+            self.update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._start_pos is not None:
+            self._current_pos = event.globalPosition().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._start_pos and self._current_pos:
+            rect = QRect(self._start_pos, event.globalPosition().toPoint()).normalized()
+            region = {
+                "left": int(rect.x()),
+                "top": int(rect.y()),
+                "width": max(80, int(rect.width())),
+                "height": max(36, int(rect.height())),
+            }
+            self.close()
+            self.on_selected(region)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()

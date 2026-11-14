@@ -66,10 +66,14 @@ def test_ocr_engine_reads_game_subtitle() -> None:
 
 
 def test_translator_prompt_and_fallback() -> None:
-    cfg = AppConfig(provider="free_fast", game_genre="Karanlık Fantezi / Orta Çağ")
+    cfg = AppConfig(
+        provider="free_fast",
+        game_genre="Red Dead Redemption 2 (Vahşi Batı 1899)",
+    )
     translator = GameTranslator(cfg)
     prompt = translator.build_system_prompt()
-    assert "Karanlık Fantezi" in prompt
+    assert "1899" in prompt
+    assert "Arthur Morgan" in prompt
 
     translated, provider = translator.translate("Stay awhile and listen!")
     assert len(translated) > 2

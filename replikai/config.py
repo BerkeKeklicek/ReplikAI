@@ -1,13 +1,64 @@
-"""Kalıcı uygulama yapılandırması (API anahtarları yerel kalır, Git'e gönderilmez)."""
+"""Kalıcı uygulama yapılandırması ve Oyun Profilleri (API anahtarları yerel kalır)."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.local.json"
+
+GAME_PROFILES: Dict[str, Dict[str, str]] = {
+    "Red Dead Redemption 2 (Vahşi Batı 1899)": {
+        "genre": "1899 Vahşi Batı / Kanun Kaçağı Draması (Red Dead Redemption 2)",
+        "style_guide": (
+            "1899 yılı Amerikan Vahşi Batı atmosferine uygun, doğal ve sert dönem Türkçesi kullan. "
+            "Arthur Morgan, Dutch, John, Sadie, Micah, Pinkerton, O'Driscoll, Valentine, Saint Denis, "
+            "Blackwater, Dead Eye gibi özel isimleri çevirme. 'Partner' -> 'ortak/dostum', "
+            "'Lawmen' -> 'kanun adamları', 'Bounty' -> 'kelle ödülü', 'Outlaw' -> 'kanun kaçağı', "
+            "'Reckon' -> 'sanırım/hesabıma göre', 'Folks' -> 'millet/ahali' gibi atmosfere uygun karşılıklar seç."
+        ),
+        "accent_color": "#E63946",
+        "subtitle_color": "#FFF3B0",
+    },
+    "RPG / Fantastik (BG3, Witcher, Elder Scrolls)": {
+        "genre": "Karanlık Fantezi & Orta Çağ RPG",
+        "style_guide": (
+            "Orta çağ ve fantastik RPG atmosferine uygun, edebi ve akıcı bir Türkçe kullan. "
+            "Şövalye, büyü, lonca, diyar, kadim metin dilini koru; modern sokak ağzı kullanma."
+        ),
+        "accent_color": "#D4AF37",
+        "subtitle_color": "#FFE66D",
+    },
+    "Bilim Kurgu / Cyberpunk (Cyberpunk 2077, Starfield)": {
+        "genre": "Bilim Kurgu & Siberpunk Aksiyon",
+        "style_guide": (
+            "Siberpunk ve gelecek temasına uygun, keskin, modern ve sokak/teknoloji terminolojisine "
+            "hakim bir Türkçe kullan. Özel şirket, sibernetik ve şehir adlarını koru."
+        ),
+        "accent_color": "#00F5D4",
+        "subtitle_color": "#00F5D4",
+    },
+    "Aksiyon / Hikaye Odaklı (GTA, Mafia, Uncharted)": {
+        "genre": "Sinematik Aksiyon & Suç Draması",
+        "style_guide": (
+            "Doğal, akıcı, sinema filmi altyazısı kalitesinde konuşma dili kullan. "
+            "Argo ve deyimleri birebir kelime çevirisi yerine Türkçe doğal karşılıklarıyla ver."
+        ),
+        "accent_color": "#3B82F6",
+        "subtitle_color": "#FFFFFF",
+    },
+    "Korku / Gerilim (Resident Evil, Silent Hill, Alan Wake)": {
+        "genre": "Psikolojik Korku & Hayatta Kalma",
+        "style_guide": (
+            "Gerilimli, ciddi ve karanlık atmosferi bozmayan bir Türkçe kullan. "
+            "Bulmaca ipuçlarını ve notları anlam kaybı olmadan net çevir."
+        ),
+        "accent_color": "#9B5DE5",
+        "subtitle_color": "#E2E8F0",
+    },
+}
 
 
 @dataclass
@@ -32,8 +83,8 @@ class AppConfig:
     capture_region: Dict[str, int] = field(
         default_factory=lambda: CaptureRegion().to_dict()
     )
-    scan_interval_ms: int = 450
-    pixel_diff_threshold: float = 2.5
+    scan_interval_ms: int = 400
+    pixel_diff_threshold: float = 2.2
     preprocess_contrast: bool = True
 
     # Çeviri Motoru Ayarları
@@ -41,7 +92,7 @@ class AppConfig:
     provider: str = "free_fast"
     source_lang: str = "Auto"
     target_lang: str = "Türkçe"
-    game_genre: str = "RPG / Hikaye Odaklı"
+    game_genre: str = "Red Dead Redemption 2 (Vahşi Batı 1899)"
 
     # API Anahtarları ve Model İsimleri (config.local.json içinde yerel tutulur)
     gemini_api_key: str = ""
@@ -54,12 +105,12 @@ class AppConfig:
     ollama_model: str = "gemma2:9b"
 
     # Overlay (Altyazı Katmanı) Ayarları
-    overlay_font_size: int = 20
-    overlay_opacity: float = 0.85
-    overlay_text_color: str = "#FFE66D"
-    overlay_bg_color: str = "#111318"
+    overlay_font_size: int = 21
+    overlay_opacity: float = 0.88
+    overlay_text_color: str = "#FFF3B0"
+    overlay_bg_color: str = "#0B0E14"
     overlay_click_through: bool = True
-    show_original_text: bool = False
+    show_original_text: bool = True
 
     # Kısayollar
     hotkey_toggle_scan: str = "alt+t"
