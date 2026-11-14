@@ -87,14 +87,21 @@ class OCREngine:
         okuyabilmesi için dikeyde harflere tam oturan (`y1-1 .. y2+2`) kırpımlar üretir.
         """
         h, w, _ = rgb_arr.shape
-        sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr)
+        sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr).copy()
 
-        if np.count_nonzero(sub_mask) < 35:
-            gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
-            sub_mask = ((gray > 165).astype(np.uint8)) * 255
+        # Geniş ekran yakalamalarında (YouTube/oyun) en sol ve en sağ %16'lık köşelerdeki
+        # video oynatıcı ikonlarını (play, 0:19/33:57 süre, ayarlar çarkı) maskeden temizle
+        if w > 650:
+            margin_x = int(w * 0.16)
+            sub_mask[:, :margin_x] = 0
+            sub_mask[:, w - margin_x :] = 0
+
+        if np.count_nonzero(sub_mask) < 25:
+            max_c = np.max(rgb_arr, axis=2)
+            sub_mask = ((max_c > 165).astype(np.uint8)) * 255
 
         row_counts = np.sum(sub_mask > 0, axis=1)
-        min_row_pixels = max(6, int(w * 0.006))
+        min_row_pixels = 5
         active_rows = row_counts >= min_row_pixels
 
         raw_bands: List[Tuple[int, int]] = []
@@ -103,19 +110,15 @@ class OCREngine:
             if is_active and start_y is None:
                 start_y = y
             elif not is_active and start_y is not None:
-                if (y - start_y) >= 8:
+                if (y - start_y) >= 7:
                     raw_bands.append((start_y, y))
                 start_y = None
-        if start_y is not None and (h - start_y) >= 8:
+        if start_y is not None and (h - start_y) >= 7:
             raw_bands.append((start_y, h))
 
-        # 3px'e kadar yakın satır içi kopuklukları birleştir
-        merged_bands: List[Tuple[int, int]] = []
-        for y1, y2 in raw_bands:
-            if merged_bands and (y1 - merged_bands[-1][1]) <= 3:
-                merged_bands[-1] = (merged_bands[-1][0], y2)
-            else:
-                merged_bands.append((y1, y2))
+        # İki altyazı satırı birbirine yapışmasın diye dikey birleştirme yapma;
+        # doğrudan tespit edilen satır bantlarını kullan
+        merged_bands: List[Tuple[int, int]] = list(raw_bands)
 
         # En yoğun 3 altyazı satırını yukarıdan aşağıya sırayla al
         if len(merged_bands) > 3:
@@ -125,9 +128,9 @@ class OCREngine:
         crops: List[np.ndarray] = []
         for y1, y2 in merged_bands:
             band_mask = sub_mask[y1:y2, :]
-            # Satır içindeki kelimeleri 45px yatay kapatma ile bağla ama 120px'ten uzak kenar ikonlarını ayır
-            closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 45), np.uint8))
-            col_active = np.sum(closed_line > 0, axis=0) >= 1
+            # Satır içindeki kelimeleri 38px yatay kapatma ile bağla
+            closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 38), np.uint8))
+            col_active = np.sum(closed_line > 0, axis=0) >= 2
 
             spans: List[Tuple[int, int]] = []
             sx = None
@@ -135,16 +138,16 @@ class OCREngine:
                 if val and sx is None:
                     sx = x
                 elif not val and sx is not None:
-                    if (x - sx) >= 14:
+                    if (x - sx) >= 16:
                         spans.append((sx, x))
                     sx = None
-            if sx is not None and (w - sx) >= 14:
+            if sx is not None and (w - sx) >= 16:
                 spans.append((sx, w))
 
-            # Aralarında <= 80px olan tüm kelime bloklarını aynı cümlede tut (baş/son kelimeler kesilmesin!)
+            # Aralarında <= 48px olan kelime bloklarını aynı cümlede tut
             merged_spans: List[Tuple[int, int]] = []
             for sx1, sx2 in spans:
-                if merged_spans and (sx1 - merged_spans[-1][1]) <= 80:
+                if merged_spans and (sx1 - merged_spans[-1][1]) <= 48:
                     merged_spans[-1] = (merged_spans[-1][0], sx2)
                 else:
                     merged_spans.append((sx1, sx2))

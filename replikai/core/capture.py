@@ -38,25 +38,22 @@ class ScreenCapturer:
     @staticmethod
     def extract_outlined_subtitle_mask(rgb_arr: np.ndarray) -> np.ndarray:
         """
-        GTA 5, RDR 2 vb. oyunlardaki parlak beyaz/sarı/renkli ve koyu dış konturlu (drop-shadow)
-        altyazı harflerini arka plandaki hareketli 3D dünyadan (yol, gökyüzü, far ışığı) ayırır.
+        Her renkteki (Beyaz, Sarı, Mavi/Camgöbeği MrBeast altyazıları, Yeşil, Kırmızı vb.)
+        konturlu veya koyu kutulu altyazı harflerini yakalar; çimen, gökyüzü ve duvar gibi
+        geniş arka plan yüzeylerini Top-Hat morfolojik filtre ile tamamen eler.
         """
-        r = rgb_arr[:, :, 0]
-        g = rgb_arr[:, :, 1]
-        b = rgb_arr[:, :, 2]
+        max_c = np.max(rgb_arr, axis=2)
 
-        # Parlak beyaz, sarı veya açık renkli altyazı pikselleri
-        white_text = (r > 175) & (g > 175) & (b > 170)
-        yellow_text = (r > 185) & (g > 155) & (b > 50)
-        bright = (white_text | yellow_text).astype(np.uint8) * 255
+        # 11x11 Top-Hat: Sadece parlak harf çizgilerini geçirir,
+        # geniş parlak yüzeyleri (gökyüzü, çimen, asfalt, duvar) sıfırlar.
+        kernel_th = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        tophat = cv2.morphologyEx(max_c, cv2.MORPH_TOPHAT, kernel_th)
 
-        # Altyazıların etrafındaki siyah kontur, gölge veya yarı saydam video altyazı kutusu (YouTube/Sinematik)
-        gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
-        dark_stroke = (gray < 105).astype(np.uint8) * 255
-
-        # Sadece yakınında (5x5 komşulukta) koyu kontur/gölge/kutu bulunan parlak pikselleri tut
+        # Altyazıların etrafındaki koyu kontur, gölge veya yarı saydam altyazı kutusu
+        dark_stroke = (max_c < 70).astype(np.uint8) * 255
         near_dark = cv2.dilate(dark_stroke, np.ones((5, 5), np.uint8), iterations=1)
-        subtitle_mask = cv2.bitwise_and(bright, near_dark)
+
+        subtitle_mask = ((tophat > 60) & (max_c > 152) & (near_dark > 0)).astype(np.uint8) * 255
         return subtitle_mask
 
     def capture_region(
