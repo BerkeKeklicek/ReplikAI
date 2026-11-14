@@ -74,17 +74,17 @@ GAME_PROFILES: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class CaptureRegion:
-    left: int = 360
-    top: int = 780
-    width: int = 1200
-    height: int = 200
+    left: int = 260
+    top: int = 790
+    width: int = 1400
+    height: int = 220
 
     def to_dict(self) -> Dict[str, int]:
         return {
             "left": int(self.left),
             "top": int(self.top),
-            "width": max(50, int(self.width)),
-            "height": max(30, int(self.height)),
+            "width": max(100, int(self.width)),
+            "height": max(40, int(self.height)),
         }
 
 

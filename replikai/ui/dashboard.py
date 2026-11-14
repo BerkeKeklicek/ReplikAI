@@ -185,6 +185,7 @@ class BridgeSignals(QObject):
 
     translation_ready = Signal(object)
     status_changed = Signal(str)
+    clear_subtitle = Signal()
     hotkey_toggle_scan = Signal()
     hotkey_select_region = Signal()
     hotkey_toggle_lock = Signal()
@@ -193,19 +194,23 @@ class BridgeSignals(QObject):
 
 
 class ReplikAIDashboard(QMainWindow):
-    """ReplikAI Pro v0.3 — Sıfır FPS-Drop Masaüstü Komuta Merkezi."""
+    """ReplikAI Pro v0.4 — Tam Otomatik Altyazı Komuta Merkezi."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ReplikAI Pro v0.3 — Zero-Drop Gerçek Zamanlı Oyun Çeviri Stüdyosu")
+        self.setWindowTitle("ReplikAI Pro — Tam Otomatik Oyun Altyazı Çeviri Motoru")
         self.resize(1240, 810)
         self.setMinimumSize(1080, 720)
         self.setStyleSheet(PRO_STYLESHEET)
 
         self.config_data = AppConfig.load()
+        # Başlangıçta ekranda kutu kalmaması için her zaman kilitli (görünmez hayalet) modda başlat
+        self.config_data.overlay_click_through = True
+
         self.signals = BridgeSignals()
         self.signals.translation_ready.connect(self._on_translation_ui)
         self.signals.status_changed.connect(self._on_status_ui)
+        self.signals.clear_subtitle.connect(self._on_clear_subtitle_ui)
         self.signals.hotkey_toggle_scan.connect(self.toggle_scanning)
         self.signals.hotkey_select_region.connect(self.open_region_selector)
         self.signals.hotkey_toggle_lock.connect(self.toggle_overlay_lock)
@@ -216,6 +221,7 @@ class ReplikAIDashboard(QMainWindow):
             config=self.config_data,
             on_translation=lambda ev: self.signals.translation_ready.emit(ev),
             on_status=lambda st: self.signals.status_changed.emit(st),
+            on_clear=lambda: self.signals.clear_subtitle.emit(),
         )
 
         self._quote_idx = 0
@@ -223,7 +229,10 @@ class ReplikAIDashboard(QMainWindow):
         self._selector_window: Optional[RegionSelector] = None
         self._window_entries: List[Tuple[Optional[int], str]] = []
 
-        self.overlay = SubtitleOverlay(self.config_data)
+        self.overlay = SubtitleOverlay(
+            self.config_data,
+            on_region_moved=self._on_overlay_region_moved,
+        )
         self._build_ui()
         self._register_hotkeys()
         self.refresh_game_window_list()
@@ -302,19 +311,19 @@ class ReplikAIDashboard(QMainWindow):
         dock_title.setStyleSheet("color: #64748B; font-size: 10px; font-weight: 800; letter-spacing: 0.8px;")
         dock_v.addWidget(dock_title)
 
-        self.btn_toggle_scan = QPushButton("▶  CANLI ÇEVİRİYİ BAŞLAT (Alt+T)")
+        self.btn_toggle_scan = QPushButton("▶  OTOMATİK ÇEVİRİYİ BAŞLAT (Alt+T)")
         self.btn_toggle_scan.setObjectName("PrimaryActionBtn")
         self.btn_toggle_scan.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle_scan.clicked.connect(self.toggle_scanning)
         dock_v.addWidget(self.btn_toggle_scan)
 
-        self.btn_borderless = QPushButton("🖥️  Oyunu Çerçevesiz Yap (Alt+B)")
-        self.btn_borderless.setObjectName("SecondaryBtn")
-        self.btn_borderless.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_borderless.clicked.connect(self.apply_borderless_fullscreen_fix)
-        dock_v.addWidget(self.btn_borderless)
+        self.btn_toggle_lock = QPushButton("📐  Altyazı Alanını Göster / Taşı (Alt+L)")
+        self.btn_toggle_lock.setObjectName("SecondaryBtn")
+        self.btn_toggle_lock.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_lock.clicked.connect(self.toggle_overlay_lock)
+        dock_v.addWidget(self.btn_toggle_lock)
 
-        self.btn_select_region = QPushButton("🎯  Altyazı Bölgesi Seç (Alt+R)")
+        self.btn_select_region = QPushButton("🎯  Fareyle Yeni Bölge Çiz (Alt+R)")
         self.btn_select_region.setObjectName("SecondaryBtn")
         self.btn_select_region.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_select_region.clicked.connect(self.open_region_selector)
@@ -326,11 +335,11 @@ class ReplikAIDashboard(QMainWindow):
         self.btn_single_shot.clicked.connect(self.trigger_single_capture)
         dock_v.addWidget(self.btn_single_shot)
 
-        self.btn_toggle_lock = QPushButton("🔒  Hayalet Kilit: Aktif (Alt+L)")
-        self.btn_toggle_lock.setObjectName("SecondaryBtn")
-        self.btn_toggle_lock.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_lock.clicked.connect(self.toggle_overlay_lock)
-        dock_v.addWidget(self.btn_toggle_lock)
+        self.btn_borderless = QPushButton("🖥️  Manuel Çerçevesiz Mod (Alt+B)")
+        self.btn_borderless.setObjectName("SecondaryBtn")
+        self.btn_borderless.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_borderless.clicked.connect(self.apply_borderless_fullscreen_fix)
+        dock_v.addWidget(self.btn_borderless)
 
         side_v.addWidget(dock_card)
         main_h.addWidget(sidebar)
@@ -856,19 +865,32 @@ class ReplikAIDashboard(QMainWindow):
         except Exception:
             self.preview_image_lbl.setText("Önizleme alınamadı")
 
+    def _on_overlay_region_moved(self, region: Dict[str, int]) -> None:
+        self.pipeline.capturer.reset_state()
+        self.metric_region[1].setText(f"{region['width']}×{region['height']} px")
+        self.refresh_region_preview()
+
+    def _on_clear_subtitle_ui(self) -> None:
+        self.overlay.clear_subtitle()
+
     def toggle_scanning(self) -> None:
         self.save_settings()
+        # Çeviri başladığında ekranda çerçeve kalmaması için otomatik hayalet moda kilitle
+        if not self.pipeline.is_running and not self.config_data.overlay_click_through:
+            self.overlay.set_click_through(True)
+            self.btn_toggle_lock.setText("📐  Altyazı Alanını Göster / Taşı (Alt+L)")
+
         active = self.pipeline.toggle()
         if active:
-            self.btn_toggle_scan.setText("⏸  CANLI ÇEVİRİYİ DURDUR (Alt+T)")
+            self.btn_toggle_scan.setText("⏸  OTOMATİK ÇEVİRİYİ DURDUR (Alt+T)")
             self.btn_toggle_scan.setObjectName("DangerActionBtn")
-            self.status_pill.setText("●  DURUM: ZERO-DROP TARAMA AKTİF")
+            self.status_pill.setText("●  DURUM: OTOMATİK ALTYAZI TAKİBİ AKTİF")
             self.status_pill.setStyleSheet(
                 "background-color: rgba(0, 245, 212, 0.12); color: #00F5D4; "
                 "border: 1px solid rgba(0, 245, 212, 0.45); border-radius: 8px; padding: 9px 12px; font-size: 11px; font-weight: 700;"
             )
         else:
-            self.btn_toggle_scan.setText("▶  CANLI ÇEVİRİYİ BAŞLAT (Alt+T)")
+            self.btn_toggle_scan.setText("▶  OTOMATİK ÇEVİRİYİ BAŞLAT (Alt+T)")
             self.btn_toggle_scan.setObjectName("PrimaryActionBtn")
             self.status_pill.setText("●  DURUM: DURAKLATILDI")
             self.status_pill.setStyleSheet(
@@ -886,6 +908,8 @@ class ReplikAIDashboard(QMainWindow):
         def _on_selected(region: Dict[str, int]) -> None:
             self.config_data.capture_region = region
             self.config_data.save()
+            # Seçilen bölgeyle altyazı kutusunu BİRE BİR aynı koordinata eşitle (%125 DPI uyumlu)
+            self.overlay.sync_geometry_from_config()
             self.pipeline.capturer.reset_state()
             self.metric_region[1].setText(f"{region['width']}×{region['height']} px")
             self.refresh_region_preview()
@@ -907,9 +931,9 @@ class ReplikAIDashboard(QMainWindow):
         self.overlay.set_click_through(new_state)
         self.config_data.save()
         if new_state:
-            self.btn_toggle_lock.setText("🔒  Hayalet Kilit: Aktif (Alt+L)")
+            self.btn_toggle_lock.setText("📐  Altyazı Alanını Göster / Taşı (Alt+L)")
         else:
-            self.btn_toggle_lock.setText("🔓  Taşıma Modu: Açık (Alt+L)")
+            self.btn_toggle_lock.setText("✅  Alanı Kilitle & Gizle (Alt+L)")
 
     def run_test_translation(self) -> None:
         self.save_settings()

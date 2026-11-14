@@ -1,16 +1,20 @@
-"""Gerçek zamanlı Yakalama -> 3D Altyazı Filtresi -> Turbo OCR -> Önbellek -> AI Çeviri iş hattı."""
+"""Gerçek zamanlı Otomatik Altyazı Radar -> Turbo OCR -> Önbellek -> AI Çeviri iş hattı."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Set
 
 from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
 from replikai.core.capture import ScreenCapturer
-from replikai.core.game_window import auto_detect_running_game, set_process_gaming_friendly_priority
+from replikai.core.game_window import (
+    auto_detect_running_game,
+    make_window_borderless_fullscreen,
+    set_process_gaming_friendly_priority,
+)
 from replikai.core.ocr_engine import OCREngine
 from replikai.core.translator import GameTranslator
 
@@ -27,17 +31,24 @@ class TranslationEvent:
 
 
 class TranslationPipeline:
-    """Arka planda çalışan, ön-ısıtmalı (warm-start) ve sıfır FPS-drop odaklı çeviri yöneticisi."""
+    """
+    Sıfır ayar gerektiren otomatik oyun altyazı takipçisi:
+    - Oyun açıldığında otomatik algılar ve DWM uyumlu çerçevesiz moda geçirir.
+    - Altyazı çıktığında ~35ms içinde okur ve çevirir.
+    - Konuşma bittiğinde (altyazı ekrandan kalktığında) Türkçe altyazıyı otomatik gizler.
+    """
 
     def __init__(
         self,
         config: AppConfig,
         on_translation: Optional[Callable[[TranslationEvent], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        on_clear: Optional[Callable[[], None]] = None,
     ) -> None:
         self.config = config
         self.on_translation = on_translation
         self.on_status = on_status
+        self.on_clear = on_clear
 
         self.capturer = ScreenCapturer()
         self.ocr = OCREngine()
@@ -45,18 +56,19 @@ class TranslationPipeline:
         self.translator = GameTranslator(config)
 
         self.target_hwnd: Optional[int] = None
+        self._borderless_applied_hwnds: Set[int] = set()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_ocr_text: str = ""
+        self._empty_ticks: int = 0
+        self._subtitle_shown: bool = False
         self._lock = threading.Lock()
         self._warmup_lock = threading.Lock()
         self._warmed_up = False
 
-        # Uygulama açılır açılmaz ONNX modelini ve HTTPS TLS soketini arka planda ısıt
         threading.Thread(target=self.warmup, daemon=True).start()
 
     def warmup(self) -> None:
-        """İlk tıklamada 3000ms soğuk başlangıç yaşanmaması için motorları tek seferde önceden ısıtır."""
         if self._warmed_up:
             return
         with self._warmup_lock:
@@ -70,23 +82,37 @@ class TranslationPipeline:
     def is_running(self) -> bool:
         return self._running
 
+    def _auto_prepare_game_window(self) -> None:
+        """Çalışan bir oyun (GTA5, RDR2 vb.) varsa kullanıcıya sormadan otomatik hazırlar."""
+        detected = auto_detect_running_game()
+        if not detected:
+            return
+        hwnd, _title, exe_name = detected
+        self.target_hwnd = hwnd
+        if hwnd not in self._borderless_applied_hwnds:
+            ok, _ = make_window_borderless_fullscreen(hwnd)
+            if ok:
+                self._borderless_applied_hwnds.add(hwnd)
+                if self.on_status:
+                    self.on_status(f"Otomatik Bağlandı: {exe_name}")
+
     def start(self) -> None:
         if self._running:
             return
         set_process_gaming_friendly_priority()
-        if not self.target_hwnd:
-            detected = auto_detect_running_game()
-            if detected:
-                self.target_hwnd = detected[0]
+        self._auto_prepare_game_window()
         self._running = True
+        self._empty_ticks = 0
         self.capturer.reset_state()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         if self.on_status:
-            self.on_status("Canlı Çeviri Aktif (Sıfır-Drop Modu)")
+            self.on_status("Otomatik Altyazı Takibi Aktif")
 
     def stop(self) -> None:
         self._running = False
+        if self.on_clear:
+            self.on_clear()
         if self.on_status:
             self.on_status("Duraklatıldı")
 
@@ -107,6 +133,17 @@ class TranslationPipeline:
             force=force,
             target_hwnd=self.target_hwnd,
         )
+
+        # Ekranda altyazı kalmadıysa mevcut Türkçe altyazıyı otomatik gizle
+        if not force and not self.capturer.subtitle_currently_visible:
+            self._empty_ticks += 1
+            if self._empty_ticks >= 2 and self._subtitle_shown:
+                self._subtitle_shown = False
+                self._last_ocr_text = ""
+                if self.on_clear:
+                    self.on_clear()
+            return None
+
         if img is None:
             return None
 
@@ -118,12 +155,14 @@ class TranslationPipeline:
         if not cleaned:
             return None
 
-        if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
+        self._empty_ticks = 0
+        if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.86):
             return None
 
         self._last_ocr_text = cleaned
+        self._subtitle_shown = True
 
-        # 1. Önbellek kontrolü (0ms çeviri süresi)
+        # 1. Önbellek kontrolü (0ms)
         cached = self.cache.get(
             cleaned,
             target_lang=self.config.target_lang,
@@ -173,8 +212,12 @@ class TranslationPipeline:
         return event
 
     def _loop(self) -> None:
+        tick_counter = 0
         while self._running:
             t_start = time.perf_counter()
+            tick_counter += 1
+            if tick_counter % 8 == 1:
+                self._auto_prepare_game_window()
             try:
                 with self._lock:
                     self.process_single_frame(force=False)

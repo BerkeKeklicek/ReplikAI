@@ -14,6 +14,22 @@ from typing import Dict, List, Optional, Tuple
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "cache.db"
 
 
+DESKTOP_NOISE_PATTERNS = (
+    "obs studio",
+    "visual studio",
+    "antigravity",
+    "recycle bin",
+    "geri dönüşüm",
+    "rapor yaz",
+    "arastirma ve",
+    "araştırma ve",
+    "replikai",
+    "hayalet mod",
+    "taşıma modu",
+    "tasima modu",
+)
+
+
 def normalize_ocr_text(text: str) -> str:
     """OCR gürültüsünü temizler ve anlamlı oyun metnini normalize eder."""
     if not text:
@@ -21,9 +37,13 @@ def normalize_ocr_text(text: str) -> str:
     cleaned = re.sub(r"[\r\n\t]+", " ", text)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     # Sadece noktalama veya tek karakterli gürültüleri ele
-    alnum_count = sum(1 for ch in cleaned if ch.isalnum())
-    if alnum_count < 2:
+    alpha_count = sum(1 for ch in cleaned if ch.isalpha())
+    if alpha_count < 3:
         return ""
+    low = cleaned.lower()
+    for pat in DESKTOP_NOISE_PATTERNS:
+        if pat in low:
+            return ""
     return cleaned
 
 

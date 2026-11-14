@@ -116,11 +116,13 @@ class RegionSelector(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._start_pos and self._current_pos:
             rect = QRect(self._start_pos, event.globalPosition().toPoint()).normalized()
+            screen = QGuiApplication.primaryScreen()
+            dpr = float(screen.devicePixelRatio()) if screen else 1.0
             region = {
-                "left": int(rect.x()),
-                "top": int(rect.y()),
-                "width": max(80, int(rect.width())),
-                "height": max(36, int(rect.height())),
+                "left": int(round(rect.x() * dpr)),
+                "top": int(round(rect.y() * dpr)),
+                "width": max(120, int(round(rect.width() * dpr))),
+                "height": max(45, int(round(rect.height() * dpr))),
             }
             self.close()
             self.on_selected(region)
