@@ -229,17 +229,82 @@ def make_window_borderless_fullscreen(hwnd: Optional[int] = None) -> Tuple[bool,
         style = user32.GetWindowLongW(target_hwnd, GWL_STYLE)
         new_style = style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
         new_style |= WS_POPUP | WS_VISIBLE
-
         user32.SetWindowLongW(target_hwnd, GWL_STYLE, new_style)
+
+        # KRİTİK: Oyunun WS_EX_TOPMOST bayrağını kaldır ve HWND_NOTOPMOST (-2) katmanına indir.
+        # Ayrıca yüksekliği `screen_h - 1` (ör. 1920x1079) yaparak Windows 10/11 DXGI DirectFlip /
+        # Independent Flip donanım bypass modunu %100 devre dışı bırak! (Tam 1920x1080 olduğunda
+        # DirectX tüm masaüstü overlay pencerelerini arkaya atar ve sadece Alt+Tab'da görünür!)
+        WS_EX_TOPMOST_FLAG = 0x00000008
+        HWND_NOTOPMOST = -2
+        SWP_NOACTIVATE = 0x0010
+        ex_style = user32.GetWindowLongW(target_hwnd, GWL_EXSTYLE)
+        if ex_style & WS_EX_TOPMOST_FLAG:
+            user32.SetWindowLongW(target_hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_TOPMOST_FLAG)
+
         user32.SetWindowPos(
-            target_hwnd,
-            0,
+            wintypes.HWND(target_hwnd),
+            wintypes.HWND(HWND_NOTOPMOST),
             0,
             0,
             screen_w,
-            screen_h,
-            SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            max(600, screen_h - 1),
+            SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
         )
-        return True, f"{exe_name or 'Oyun'} Çerçevesiz Tam Ekran ({screen_w}x{screen_h}) yapıldı!"
+        return True, f"{exe_name or 'Oyun'} DWM Overlay Uyumlu Çerçevesiz Tam Ekran ({screen_w}x{screen_h - 1}) yapıldı!"
     except Exception as exc:
         return False, f"Pencere dönüştürme hatası: {exc}"
+
+
+def ensure_game_window_allows_overlay(target_hwnd: Optional[int] = None) -> None:
+    """
+    GTA 5 / RDR 2 ön plana geçtiğinde kendi kendine tekrar WS_EX_TOPMOST veya tam 1920x1080
+    Independent Flip moduna geçerse, oyunu anında HWND_NOTOPMOST (screen_h - 1) katmanında tutar.
+    Böylece çeviri yazıları Alt+Tab atmaya gerek kalmadan DOĞRUDAN OYUN EKRANININ ÜSTÜNDE görünür!
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        fg_hwnd = int(user32.GetForegroundWindow())
+        if not fg_hwnd:
+            return
+        exe_name = get_window_process_name(fg_hwnd)
+        is_target_game = (exe_name in KNOWN_GAME_PROCESSES) or (target_hwnd and fg_hwnd == int(target_hwnd))
+        if not is_target_game or exe_name in NON_GAME_PROCESSES:
+            return
+
+        WS_EX_TOPMOST_FLAG = 0x00000008
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+
+        screen_w = user32.GetSystemMetrics(0)
+        screen_h = user32.GetSystemMetrics(1)
+        rect = wintypes.RECT()
+        user32.GetWindowRect(wintypes.HWND(fg_hwnd), ctypes.byref(rect))
+        win_w = int(rect.right - rect.left)
+        win_h = int(rect.bottom - rect.top)
+
+        ex_style = user32.GetWindowLongW(wintypes.HWND(fg_hwnd), GWL_EXSTYLE)
+        has_topmost = bool(ex_style & WS_EX_TOPMOST_FLAG)
+        is_exact_fullscreen = (win_w == screen_w and win_h == screen_h and rect.left == 0 and rect.top == 0)
+
+        if has_topmost or is_exact_fullscreen:
+            style = user32.GetWindowLongW(wintypes.HWND(fg_hwnd), GWL_STYLE)
+            new_style = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP | WS_VISIBLE
+            user32.SetWindowLongW(wintypes.HWND(fg_hwnd), GWL_STYLE, new_style)
+            if has_topmost:
+                user32.SetWindowLongW(wintypes.HWND(fg_hwnd), GWL_EXSTYLE, ex_style & ~WS_EX_TOPMOST_FLAG)
+            user32.SetWindowPos(
+                wintypes.HWND(fg_hwnd),
+                wintypes.HWND(HWND_NOTOPMOST),
+                0,
+                0,
+                screen_w,
+                max(600, screen_h - 1),
+                SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+    except Exception:
+        pass

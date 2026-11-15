@@ -304,11 +304,16 @@ class UniversalHUDRadar:
         if int(np.count_nonzero(target_mask)) < 8:
             return [], patches_changed
 
-        # Kelime/satır kutularını birleştir (yatay 14px, dikey 3px coarse ölçekte = 56x12px gerçek ölçekte)
+        # Kelime/satır kutularını birleştir ve baş/son harflerin kesilmemesi için yatayda 6px genişlet
         connected = cv2.morphologyEx(
             target_mask,
             cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (14, 3)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (16, 3)),
+        )
+        connected = cv2.dilate(
+            connected,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (6, 2)),
+            iterations=1,
         )
         num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(connected, connectivity=8)
 
@@ -320,15 +325,15 @@ class UniversalHUDRadar:
             ch = int(stats[i, cv2.CC_STAT_HEIGHT])
 
             # Gerçek bir kelime/bildirim kutusu boyutu kontrolü (coarse 480x270 ölçekte)
-            if cw < 9 or cw > 280 or ch < 3 or ch > 55:
+            if cw < 9 or cw > 320 or ch < 3 or ch > 65:
                 continue
 
             comb_energy = int(np.count_nonzero(cur_comb[cy : cy + ch, cx : cx + cw]))
             if comb_energy < 7:
                 continue
 
-            # Gerçek ekran koordinatlarına (1920x1080) çevir
-            pad_x, pad_y = 8, 5
+            # Gerçek ekran koordinatlarına (1920x1080) çevir (sol/sağ ilk-son harf payı pad_x=24)
+            pad_x, pad_y = 24, 7
             rx1 = max(0, int(cx * sx) - pad_x)
             ry1 = max(0, int(cy * sy) - pad_y)
             rx2 = min(fw, int((cx + cw) * sx) + pad_x)

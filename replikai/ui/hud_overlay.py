@@ -7,7 +7,7 @@ from ctypes import wintypes
 import sys
 from typing import List
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, QTimer, Qt
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -19,7 +19,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from replikai.core.game_window import exclude_window_from_capture
+from replikai.core.game_window import (
+    ensure_game_window_allows_overlay,
+    exclude_window_from_capture,
+)
 from replikai.core.hud_radar import HUDTextPatch
 
 GWL_EXSTYLE = -20
@@ -59,6 +62,10 @@ class SpatialHUDOverlay(QWidget):
         self.show()
         self._apply_win32_passthrough_and_capture_exclusion()
 
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.timeout.connect(self.ensure_topmost)
+        self._topmost_timer.start(300)
+
     @staticmethod
     def get_dpr() -> float:
         screen = QGuiApplication.primaryScreen()
@@ -67,9 +74,28 @@ class SpatialHUDOverlay(QWidget):
     def _sync_fullscreen_geometry(self) -> None:
         screen = QGuiApplication.primaryScreen()
         if screen:
-            self.setGeometry(screen.geometry())
+            g = screen.geometry()
+            self.setGeometry(g.x(), g.y(), g.width(), max(400, g.height() - 1))
         else:
-            self.setGeometry(0, 0, 1920, 1080)
+            self.setGeometry(0, 0, 1920, 1079)
+
+    def ensure_topmost(self) -> None:
+        if sys.platform != "win32" or not self._patches:
+            return
+        try:
+            ensure_game_window_allows_overlay()
+            hwnd = int(self.winId())
+            ctypes.windll.user32.SetWindowPos(
+                wintypes.HWND(hwnd),
+                wintypes.HWND(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        except Exception:
+            pass
 
     def _apply_win32_passthrough_and_capture_exclusion(self) -> None:
         if sys.platform != "win32":
@@ -105,10 +131,11 @@ class SpatialHUDOverlay(QWidget):
             self.update()
 
     def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
         if not self._patches:
+            painter.fillRect(0, 0, 1, 1, QColor(0, 0, 0, 1))
             return
 
-        painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 

@@ -21,7 +21,10 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QVBoxLayout, QLabel, QWidget
 
 from replikai.config import AppConfig
-from replikai.core.game_window import exclude_window_from_capture
+from replikai.core.game_window import (
+    ensure_game_window_allows_overlay,
+    exclude_window_from_capture,
+)
 
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
@@ -66,16 +69,16 @@ class CleanOutlinedLabel(QWidget):
     def setTextColor(self, hex_color: str) -> None:
         col = QColor(hex_color)
         if not col.isValid():
-            col = QColor("#090D14")
+            col = QColor("#FFFFFF")
         self._text_color = col
-        # Metin siyah/koyu ise etrafına temiz beyaz ışık konturu, açık renkse siyah kontur uygula
+        # Metin siyah/koyu ise etrafına kalın temiz beyaz ışık konturu, açık renkse kalın siyah kontur uygula
         lum = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
         if lum < 115:
-            self._stroke_color = QColor(255, 255, 255, 245)
-            self._stroke_width = 4.0
+            self._stroke_color = QColor(255, 255, 255, 250)
+            self._stroke_width = 5.4
         else:
-            self._stroke_color = QColor(0, 0, 0, 245)
-            self._stroke_width = 3.8
+            self._stroke_color = QColor(0, 0, 0, 250)
+            self._stroke_width = 5.2
         self.update()
 
     def _wrap_lines(self, max_width: float, fm: QFontMetricsF) -> list[str]:
@@ -176,7 +179,7 @@ class SubtitleOverlay(QWidget):
         # Tam ekran video veya oyun açıldığında Z-Order'da en üstte kalmayı garantileyen zamanlayıcı
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.ensure_topmost)
-        self._topmost_timer.start(500)
+        self._topmost_timer.start(250)
 
         self._build_layout()
         self.sync_geometry_from_config()
@@ -191,10 +194,11 @@ class SubtitleOverlay(QWidget):
         return float(screen.devicePixelRatio()) if screen else 1.0
 
     def ensure_topmost(self) -> None:
-        """Tam ekran YouTube videosu veya oyun açıldığında overlay'i tekrar en üst katmana taşır."""
+        """Tam ekran YouTube videosu veya oyun açıldığında oyunu HWND_NOTOPMOST yapıp overlay'i en üste taşır."""
         if sys.platform != "win32":
             return
         try:
+            ensure_game_window_allows_overlay()
             hwnd = int(self.winId())
             ctypes.windll.user32.SetWindowPos(
                 wintypes.HWND(hwnd),

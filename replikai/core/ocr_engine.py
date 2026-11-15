@@ -89,12 +89,14 @@ class OCREngine:
         h, w, _ = rgb_arr.shape
         sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr).copy()
 
-        # Geniş ekran yakalamalarında (YouTube/oyun) en sol ve en sağ %15'lik köşelerdeki
-        # video oynatıcı ikonlarını (play, 0:19/33:57 süre, ayarlar çarkı) maskeden temizle
-        if w > 650:
-            margin_x = int(w * 0.15)
-            sub_mask[:, :margin_x] = 0
-            sub_mask[:, w - margin_x :] = 0
+        # Sadece çok geniş (w > 950) ve yüksek (h > 140) yakalamalarda en alt 45px köşelerdeki
+        # YouTube video oynatıcı ikonlarını (play, süre, çark) maskeden temizle;
+        # orta satırlardaki GTA 5 / RDR 2 uzun altyazılarının solunu/sağını ASLA kesme!
+        if w > 950 and h > 140:
+            corner_x = int(w * 0.14)
+            corner_y = h - 46
+            sub_mask[corner_y:, :corner_x] = 0
+            sub_mask[corner_y:, w - corner_x :] = 0
 
         if np.count_nonzero(sub_mask) < 25:
             max_c = np.max(rgb_arr, axis=2)
@@ -164,8 +166,8 @@ class OCREngine:
 
             exact_y1 = max(0, y1 + int(ys.min()) - 2)
             exact_y2 = min(h, y1 + int(ys.max()) + 3)
-            exact_x1 = max(0, best_x1 + int(xs.min()) - 5)
-            exact_x2 = min(w, best_x1 + int(xs.max()) + 6)
+            exact_x1 = max(0, best_x1 + int(xs.min()) - 10)
+            exact_x2 = min(w, best_x1 + int(xs.max()) + 10)
 
             crop = rgb_arr[exact_y1:exact_y2, exact_x1:exact_x2]
             ch, cw = crop.shape[:2]

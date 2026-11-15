@@ -67,7 +67,13 @@ def normalize_ocr_text(text: str) -> str:
     # Arka plan/kontur kaynaklı anlamsız OCR ses/harf gürültülerini temizle ('h NGH!', 'u GHgh!', 'UR')
     cleaned = re.sub(r"\b(?:[uUhH]\s+)?(?:NGH|GHgh|HH|UR)\b[!?.]*", "", cleaned)
     cleaned = re.sub(r"\bWhoeuer\b", "Whoever", cleaned, flags=re.IGNORECASE)
+    # Cümle başındaki tek harfli tuş/ikon gürültülerini temizle ('D You are through...' -> 'You are through...')
+    cleaned = re.sub(r"^[BCDFGJKLMPQRSTVWXYZ]\s+(?=[A-Z][a-z])", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,_|~`^•·")
+
+    # GTA 5 sağ üst para/saat sayacı gibi salt sayısal HUD satırlarını ('MONDAY 13:58 $22,331,609') ele
+    if re.search(r"\$\d[\d,]*", cleaned) and re.search(r"\d{1,2}:\d{2}", cleaned):
+        return ""
 
     # Uzun altyazıların en sonuna çerçeve/kontur yüzünden eklenen tek harfli ' A' veya ' |' gürültüsünü temizle
     raw_words = cleaned.split()
