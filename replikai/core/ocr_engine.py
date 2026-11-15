@@ -1,4 +1,4 @@
-"""Yüksek Doğruluklu Oyun & Video Altyazı OCR Motoru (Hassas DBNet-Eşdeğeri Satır Kırpıcı + Warm ONNX)."""
+"""Yüksek Doğruluklu Oyun & Video Altyazı OCR Motoru (Hassas DBNet-Eşdeğeri Satır Kırpıcı + Warm ONNX + OverTranslate SpeakerLabel)."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import requests
 
 from replikai.core.cache import normalize_ocr_text
 from replikai.core.capture import ScreenCapturer
+from replikai.core.dialogue_grouper import DialogueTextGrouper
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ class OCREngine:
     1. Harflerin üst/alt sınırlarını DBNet gibi tam 1-2px toleransla (`y1-1 .. y2+2`) kırpar;
        böylece CRNN 48px yüksekliğe ölçeklediğinde harfler ezilmez ve orta harfler yutulmaz.
     2. Cümlenin başındaki ve sonundaki kelimeleri kesmez.
+    3. OverTranslate `SpeakerLabel` geometrisi ile üst satırdaki kısa konuşmacı adını
+       (`"Michael"`) diyalog satırından ayırıp `"Michael: ..."` formatına dönüştürür.
     """
 
     def __init__(self, min_confidence: float = 0.52) -> None:
@@ -81,10 +84,13 @@ class OCREngine:
                 self.backend_name = "Devre Dışı"
 
     @staticmethod
-    def _slice_subtitle_lines(rgb_arr: np.ndarray) -> List[np.ndarray]:
+    def _slice_subtitle_lines_with_bounds(
+        rgb_arr: np.ndarray,
+    ) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
         """
         Görüntüdeki altyazı satırlarını tespit eder ve CRNN'in maksimum doğrulukla (%99+)
-        okuyabilmesi için dikeyde harflere tam oturan (`y1-2 .. y2+3`) kırpımlar üretir.
+        okuyabilmesi için dikeyde harflere tam oturan (`y1-2 .. y2+3`) kırpımları ve
+        `(x, y, w, h)` koordinatlarını üretir.
         """
         h, w, _ = rgb_arr.shape
         sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr).copy()
@@ -123,10 +129,10 @@ class OCREngine:
 
         # En yoğun 2 altyazı satırını yukarıdan aşağıya sırayla al (gereksiz ONNX çağrılarını önler)
         if len(merged_bands) > 2:
-            merged_bands.sort(key=lambda b: int(np.sum(sub_mask[b[0]:b[1], :] > 0)), reverse=True)
+            merged_bands.sort(key=lambda b: int(np.sum(sub_mask[b[0] : b[1], :] > 0)), reverse=True)
             merged_bands = sorted(merged_bands[:2], key=lambda b: b[0])
 
-        crops: List[np.ndarray] = []
+        results: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
         for y1, y2 in merged_bands:
             band_mask = sub_mask[y1:y2, :]
             # Satır içindeki kelimeleri 45px yatay kapatma ile bağla
@@ -172,9 +178,13 @@ class OCREngine:
             crop = rgb_arr[exact_y1:exact_y2, exact_x1:exact_x2]
             ch, cw = crop.shape[:2]
             if cw >= 16 and ch >= 8:
-                crops.append(crop)
+                results.append((crop, (exact_x1, exact_y1, cw, ch)))
 
-        return crops
+        return results
+
+    @classmethod
+    def _slice_subtitle_lines(cls, rgb_arr: np.ndarray) -> List[np.ndarray]:
+        return [crop for crop, _bounds in cls._slice_subtitle_lines_with_bounds(rgb_arr)]
 
     def extract_text(self, image: Image.Image) -> str:
         """Görüntüdeki oyun veya video altyazısını yüksek doğrulukla okur."""
@@ -185,30 +195,39 @@ class OCREngine:
 
         try:
             rgb_arr = np.asarray(image.convert("RGB"))
-            line_crops = self._slice_subtitle_lines(rgb_arr)
+            line_items = self._slice_subtitle_lines_with_bounds(rgb_arr)
 
-            recognized_lines: List[str] = []
+            recognized: List[Tuple[str, Tuple[int, int, int, int]]] = []
             with self._lock:
-                for crop in line_crops:
+                for crop, bounds in line_items:
                     res, _ = self._rapid_ocr(crop, use_det=False, use_cls=False, use_rec=True)
                     if res and len(res) > 0:
                         text, score = str(res[0][0]).strip(), float(res[0][1])
                         if score >= self.min_confidence and text:
-                            recognized_lines.append(text)
+                            recognized.append((text, bounds))
 
             self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
-            if recognized_lines:
-                return normalize_ocr_text(" ".join(recognized_lines))
+            if not recognized:
+                return ""
 
-            return ""
+            # OverTranslate `SpeakerLabel` kontrolü:
+            # Eğer 2 satır okunduysa ve üstteki satır kısa bir konuşmacı adıysa ("Michael" / "Franklin"),
+            # cümleye yapıştırmak yerine "Michael: ..." olarak ayır!
+            if len(recognized) == 2:
+                top_txt, top_b = recognized[0]
+                bot_txt, bot_b = recognized[1]
+                if DialogueTextGrouper.is_speaker_label_line(top_txt, top_b, bot_b):
+                    return normalize_ocr_text(f"{top_txt}: {bot_txt}")
+
+            return normalize_ocr_text(" ".join(txt for txt, _ in recognized))
         except Exception as exc:
             logger.error("OCR okuma hatası: %s", exc)
             return ""
 
     def extract_hud_crop_text(self, crop_rgb: np.ndarray) -> str:
         """
-        UniversalHUDRadar tarafından kırpılan küçük HUD/Menü/Telefon kutusunu (~15-25ms) okur.
-        'MAP', 'BRIEF', 'SETTINGS' gibi tek kelimelik menü başlıklarını da destekler.
+        UniversalHUDRadar tarafından kırpılan küçük veya çok satırlı HUD/Menü/Telefon
+        kutusunu (~15-35ms) okur.
         """
         self._ensure_initialized()
         if not self._rapid_ocr or crop_rgb.size == 0:
@@ -216,7 +235,7 @@ class OCREngine:
 
         try:
             ch, cw = crop_rgb.shape[:2]
-            if ch > 54:
+            if ch > 44:
                 line_crops = self._slice_subtitle_lines(crop_rgb)
                 if not line_crops:
                     line_crops = [crop_rgb]
@@ -225,11 +244,11 @@ class OCREngine:
 
             parts: List[str] = []
             with self._lock:
-                for lc in line_crops[:3]:
+                for lc in line_crops[:4]:
                     res, _ = self._rapid_ocr(lc, use_det=False, use_cls=False, use_rec=True)
                     if res and len(res) > 0:
                         txt, score = str(res[0][0]).strip(), float(res[0][1])
-                        if score >= 0.58 and txt:
+                        if score >= 0.56 and txt:
                             parts.append(txt)
 
             raw = " ".join(parts).strip()

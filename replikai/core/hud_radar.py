@@ -1,6 +1,6 @@
 """3 Filtreli Evrensel Oyun HUD, Bildirim, Telefon ve ESC Menü Radarı (~0.9ms CPU, Sıfır FPS-Drop).
 
-MİMARİ (3 Matematiksel Filtre):
+MİMARİ (3 Matematiksel Filtre + OverTranslate Entegrasyonu):
 1. Tarak Dişi Yatay Harf Ritmi (Sobel-X + Top-Hat Comb Filter):
    3D dünyadaki araba farı, direk, bina ve çit gibi tek parça objeleri eler;
    sadece yan yana dizilmiş 'Harf-Boşluk-Harf' yatay geçiş ritmine sahip gerçek yazıları geçirir.
@@ -12,17 +12,23 @@ MİMARİ (3 Matematiksel Filtre):
    Taranan bir koordinat (yazı olsun veya olmasın) pikselleri değişmediği sürece kilitlenir;
    oyuncu aynı yerde saatlerce dursa bile tekrar taranmaz (%0 CPU). Oyun bildirimi kapattığı an
    üstündeki Türkçe yama da otomatik silinir.
+4. OverTranslate `DialogueTextGrouper` + `RealtimeNaturalBackground` + `SourceTextColorSampler`:
+   - Çok satırlı bildirim/ipucu paragraflarını geometrik hizayla tek kutuda birleştirir (menü maddelerini ayrı tutar).
+   - Orijinal İngilizce harfleri düz kutu yerine doğal arka plan doku yaması (`Inpainting`) ile siler
+     ve oyunun orijinal harf rengini + konturunu WCAG 2.0 kontrastıyla korur.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+from replikai.core.dialogue_grouper import DialogueTextGrouper
+from replikai.core.natural_patch import RealtimeNaturalBackground, SourceTextColorSampler
 
 # Tek kelimelik veya yaygın oyun menü/HUD başlıkları için 0.0 ms anlık sözlük
 HUD_INSTANT_GLOSSARY: Dict[str, str] = {
@@ -42,7 +48,7 @@ HUD_INSTANT_GLOSSARY: Dict[str, str] = {
     "controls": "KONTROLLER",
     "keyboard / mouse": "KLAVYE / FARE",
     "key bindings": "TUŞ ATAMALARI",
-    " gamepad": "OYUN KOLU",
+    "gamepad": "OYUN KOLU",
     "camera": "KAMERA",
     "saving and startup": "KAYIT VE BAŞLANGIÇ",
     "notifications": "BİLDİRİMLER",
@@ -90,11 +96,12 @@ class HUDCandidateBox:
     text_rgb: Tuple[int, int, int]
     crop_rgb: np.ndarray
     comb_energy: int
+    outline_rgb: Tuple[int, int, int] = (10, 14, 20)
 
 
 @dataclass
 class HUDTextPatch:
-    """Ekranda orijinal İngilizce kelimenin tam üstüne (In-Place) basılacak Türkçe yama."""
+    """Ekranda orijinal İngilizce kelimenin tam üstüne (In-Place) basılacak doğal Türkçe yama."""
 
     zone_key: str
     x: int
@@ -106,11 +113,14 @@ class HUDTextPatch:
     bg_rgb: Tuple[int, int, int]
     text_rgb: Tuple[int, int, int]
     comb_energy: int
+    outline_rgb: Tuple[int, int, int] = (10, 14, 20)
+    natural_bg_patch: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 class UniversalHUDRadar:
     """
-    480x270 ölçekte ~0.9ms içinde çalışan, 3 filtreli evrensel oyun içi yazı radarı.
+    480x270 ölçekte ~0.9ms içinde çalışan, 3 filtreli + OverTranslate doğal doku yamalı
+    evrensel oyun içi yazı radarı.
     """
 
     COARSE_W = 480
@@ -156,7 +166,7 @@ class UniversalHUDRadar:
         # Tarak Dişi (Comb) Yatay Harf Geçiş Yoğunluğu: |I(x+1) - I(x)| > 36
         dx = np.abs(np.diff(max_c.astype(np.int16), axis=1, append=0))
         horiz_edges = (dx > 36).astype(np.uint8)
-        # 11x3 yatay pencerede en az 4 harf kenarı geçişi olmalı (yan yana harf dizisi şartı!)
+        # 11x3 yatay pencerede en az 5 harf kenarı geçişi olmalı (yan yana harf dizisi şartı!)
         edge_density = cv2.boxFilter(horiz_edges, ddepth=-1, ksize=(11, 3), normalize=False)
 
         comb_mask = (
@@ -186,35 +196,72 @@ class UniversalHUDRadar:
     @staticmethod
     def sample_box_colors(crop_rgb: np.ndarray) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
         """
-        Orijinal kelimenin arkasındaki HUD kutusu rengini (`bg_rgb`) ve harf rengini (`text_rgb`)
-        otomatik örnekler; böylece Türkçe kelime yaması oyunun kendi menü tasarımına birebir uyar.
+        OverTranslate `SourceTextColorSampler` + `OverlayTextColor` kullanarak
+        arka plan rengini (`bg_rgb`) ve WCAG/HSL ayarlı harf rengini (`text_rgb`) döndürür.
         """
-        if crop_rgb.size == 0:
-            return (14, 18, 26), (248, 250, 252)
-        lum = 0.299 * crop_rgb[:, :, 0] + 0.587 * crop_rgb[:, :, 1] + 0.114 * crop_rgb[:, :, 2]
-        bg_mask = lum <= np.percentile(lum, 45)
-        fg_mask = lum >= np.percentile(lum, 82)
+        style = SourceTextColorSampler.sample(crop_rgb)
+        return style.background_rgb, style.text_rgb
 
-        if np.any(bg_mask):
-            bg_med = np.median(crop_rgb[bg_mask], axis=0)
-            bg_rgb = (int(bg_med[0]), int(bg_med[1]), int(bg_med[2]))
-        else:
-            bg_rgb = (14, 18, 26)
+    @staticmethod
+    def _group_raw_rects(
+        raw_rects: List[Tuple[int, int, int, int, int]],
+        fw: int,
+        fh: int,
+    ) -> List[Tuple[int, int, int, int, int]]:
+        """
+        OverTranslate `DialogueTextGrouper` kurallarıyla:
+        1. Aynı satırdaki yan yana kelimeleri (`adjacent_in_row`) birleştirir.
+        2. Alt alta dizilmiş paragraf satırlarını (`next_paragraph_row` — ör. GTA 5 sol üst 3 satırlık
+           bilgi kutusu) tek bir paragraf kutusunda birleştirir; menü maddelerini ise ayrı tutar!
+        Girdi/Çıktı elemanları: `(x, y, w, h, comb_energy)`
+        """
+        if len(raw_rects) <= 1:
+            return raw_rects
 
-        if np.any(fg_mask):
-            fg_med = np.median(crop_rgb[fg_mask], axis=0)
-            text_rgb = (int(fg_med[0]), int(fg_med[1]), int(fg_med[2]))
-        else:
-            text_rgb = (248, 250, 252)
+        # 1. Yatayda aynı satırdaki yakın kelime parçalarını birleştir
+        sorted_h = sorted(raw_rects, key=lambda r: (r[1] // 16, r[0]))
+        row_merged: List[Tuple[int, int, int, int, int]] = []
+        for rect in sorted_h:
+            rx, ry, rw, rh, renergy = rect
+            if row_merged:
+                px, py, pw, ph, penergy = row_merged[-1]
+                if DialogueTextGrouper.adjacent_in_row((px, py, pw, ph), (rx, ry, rw, rh)):
+                    nx1 = min(px, rx)
+                    ny1 = min(py, ry)
+                    nx2 = max(px + pw, rx + rw)
+                    ny2 = max(py + ph, ry + rh)
+                    row_merged[-1] = (nx1, ny1, nx2 - nx1, ny2 - ny1, penergy + renergy)
+                    continue
+            row_merged.append(rect)
 
-        # Kontrast çok düşükse okunabilirliği garanti altına al
-        bg_l = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
-        fg_l = 0.299 * text_rgb[0] + 0.587 * text_rgb[1] + 0.114 * text_rgb[2]
-        if abs(fg_l - bg_l) < 75:
-            bg_rgb = (12, 16, 24)
-            text_rgb = (248, 250, 252)
+        # 2. Dikeyde aynı paragrafın devamı olan satırları (`next_paragraph_row`) birleştir
+        sorted_v = sorted(row_merged, key=lambda r: (r[1], r[0]))
+        groups: List[List[Tuple[int, int, int, int, int]]] = []
+        for rect in sorted_v:
+            rx, ry, rw, rh, _ = rect
+            placed = False
+            for grp in groups:
+                # Paragraf en fazla 4 satır yüksekliğinde olabilir (dev menü listelerini yutmaması için)
+                if len(grp) >= 4:
+                    continue
+                px, py, pw, ph, _ = grp[-1]
+                if DialogueTextGrouper.next_paragraph_row((px, py, pw, ph), (rx, ry, rw, rh)):
+                    grp.append(rect)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([rect])
 
-        return bg_rgb, text_rgb
+        final_rects: List[Tuple[int, int, int, int, int]] = []
+        for grp in groups:
+            gx1 = max(0, min(r[0] for r in grp))
+            gy1 = max(0, min(r[1] for r in grp))
+            gx2 = min(fw, max(r[0] + r[2] for r in grp))
+            gy2 = min(fh, max(r[1] + r[3] for r in grp))
+            total_e = sum(r[4] for r in grp)
+            final_rects.append((gx1, gy1, gx2 - gx1, gy2 - gy1, total_e))
+
+        return final_rects
 
     def scan_for_new_hud_boxes(
         self,
@@ -224,7 +271,7 @@ class UniversalHUDRadar:
         max_candidates: int = 8,
     ) -> Tuple[List[HUDCandidateBox], bool]:
         """
-        3 Filtreli tarama yapar:
+        3 Filtreli + OverTranslate Gruplamalı tarama yapar:
         1. Ekrandan kaybolan eski HUD/menü bildirimlerini `active_patches` listesinden siler.
         2. Sadece yeni doğup sabitlenen (`Pop-In + Stationary`) ve `Dead-Zone` kilidinde olmayan
            gerçek yazı kutularını döndürür.
@@ -279,11 +326,6 @@ class UniversalHUDRadar:
             # ESC / Menü tuşuna basıldığında ekrandaki tüm sabit tarak-dişi yazılarını tek seferde al
             target_mask = cur_comb
         else:
-            # Sadece:
-            # - baseline'da (t-2) ORADA OLMAYAN (`_baseline_comb == 0`),
-            # - prev'de (t-1) ANİDEN DOĞAN (`_prev_comb > 0`),
-            # - ve şu an (t) AYNI PİKSELDE SABİT DURAN (`cur_comb > 0`) harfleri al!
-            # (Oyuncu sabit durduğunda etraftaki 3D objeler baseline'da da olduğu için %100 elenir!)
             prev_dilated = cv2.dilate(self._prev_comb, np.ones((3, 3), np.uint8), iterations=1)
             base_dilated = cv2.dilate(self._baseline_comb, np.ones((5, 5), np.uint8), iterations=1)
             born_and_stationary = (
@@ -317,7 +359,7 @@ class UniversalHUDRadar:
         )
         num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(connected, connectivity=8)
 
-        candidates: List[HUDCandidateBox] = []
+        raw_rects: List[Tuple[int, int, int, int, int]] = []
         for i in range(1, num_labels):
             cx = int(stats[i, cv2.CC_STAT_LEFT])
             cy = int(stats[i, cv2.CC_STAT_TOP])
@@ -332,8 +374,8 @@ class UniversalHUDRadar:
             if comb_energy < 7:
                 continue
 
-            # Gerçek ekran koordinatlarına (1920x1080) çevir (sol/sağ ilk-son harf payı pad_x=24)
-            pad_x, pad_y = 24, 7
+            # Gerçek ekran koordinatlarına (1920x1080) çevir (sol/sağ ilk-son harf payı pad_x=18)
+            pad_x, pad_y = 18, 6
             rx1 = max(0, int(cx * sx) - pad_x)
             ry1 = max(0, int(cy * sy) - pad_y)
             rx2 = min(fw, int((cx + cw) * sx) + pad_x)
@@ -344,13 +386,20 @@ class UniversalHUDRadar:
             if rw < 36 or rh < 14:
                 continue
 
+            raw_rects.append((rx1, ry1, rw, rh, comb_energy))
+
+        # OverTranslate DialogueTextGrouper ile çok satırlı bildirim paragraflarını tek kutuda birleştir
+        grouped_rects = self._group_raw_rects(raw_rects, fw, fh)
+
+        candidates: List[HUDCandidateBox] = []
+        for rx1, ry1, rw, rh, comb_energy in grouped_rects:
             zkey = self._make_zone_key(rx1, ry1, rw, rh)
             # 3. FİLTRE: Zaten aktif yaması varsa veya Dead-Zone kilidindeyse ASLA tekrar tarama!
             if not force_full_menu and (zkey in self.active_patches or zkey in self._dead_zones):
                 continue
 
-            crop_rgb = full_rgb[ry1:ry2, rx1:rx2].copy()
-            bg_rgb, text_rgb = self.sample_box_colors(crop_rgb)
+            crop_rgb = full_rgb[ry1 : ry1 + rh, rx1 : rx1 + rw].copy()
+            sampled_style = SourceTextColorSampler.sample(crop_rgb)
             candidates.append(
                 HUDCandidateBox(
                     zone_key=zkey,
@@ -358,8 +407,9 @@ class UniversalHUDRadar:
                     y=ry1,
                     w=rw,
                     h=rh,
-                    bg_rgb=bg_rgb,
-                    text_rgb=text_rgb,
+                    bg_rgb=sampled_style.background_rgb,
+                    text_rgb=sampled_style.text_rgb,
+                    outline_rgb=sampled_style.outline_rgb or (10, 14, 20),
                     crop_rgb=crop_rgb,
                     comb_energy=comb_energy,
                 )
@@ -374,8 +424,12 @@ class UniversalHUDRadar:
         self._dead_zones[box.zone_key] = box.comb_energy
 
     def register_patch(self, box: HUDCandidateBox, source_text: str, translated_text: str) -> HUDTextPatch:
-        """Çevrilen HUD/menü kutusunu aktif yerinde (In-Place) yama olarak kaydeder."""
+        """
+        Çevrilen HUD/menü kutusunu OverTranslate `RealtimeNaturalBackground` doğal doku yamasıyla
+        birlikte aktif yerinde (In-Place) yama olarak kaydeder.
+        """
         self._dead_zones[box.zone_key] = box.comb_energy
+        natural_bg = RealtimeNaturalBackground.build_natural_patch(box.crop_rgb, box.bg_rgb)
         patch = HUDTextPatch(
             zone_key=box.zone_key,
             x=box.x,
@@ -386,7 +440,9 @@ class UniversalHUDRadar:
             translated_text=translated_text,
             bg_rgb=box.bg_rgb,
             text_rgb=box.text_rgb,
+            outline_rgb=box.outline_rgb,
             comb_energy=box.comb_energy,
+            natural_bg_patch=natural_bg,
         )
         self.active_patches[box.zone_key] = patch
         return patch

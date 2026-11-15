@@ -10,6 +10,7 @@ from typing import Callable, List, Optional, Set
 from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
 from replikai.core.capture import ScreenCapturer
+from replikai.core.dialogue_grouper import DialogueTextGrouper
 from replikai.core.game_window import (
     auto_detect_running_game,
     is_escape_key_pressed,
@@ -35,10 +36,11 @@ class TranslationEvent:
 
 class TranslationPipeline:
     """
-    Sıfır ayar gerektiren otomatik oyun altyazı takipçisi:
+    Sıfır ayar gerektiren otomatik oyun altyazı & HUD takipçisi (OverTranslate Mimari Entegrasyonlu):
     - Oyun açıldığında otomatik algılar ve DWM uyumlu çerçevesiz moda geçirir.
-    - Altyazı çıktığında ~35ms içinde okur ve çevirir.
+    - Altyazı çıktığında ~35ms içinde okur, konuşmacı adını (`SpeakerLabel`) ayırır ve çevirir.
     - Konuşma bittiğinde (altyazı ekrandan kalktığında) Türkçe altyazıyı otomatik gizler.
+    - OverTranslate `RealtimeBackgroundCadence` adaptif tarama hızı ile boşta %0 CPU tüketir.
     """
 
     def __init__(
@@ -69,6 +71,7 @@ class TranslationPipeline:
         self._prev_clause_text: str = ""
         self._prev_clause_time: float = 0.0
         self._empty_ticks: int = 0
+        self._idle_cycles: int = 0
         self._subtitle_shown: bool = False
         self._last_esc_time: float = 0.0
         self._lock = threading.Lock()
@@ -112,6 +115,7 @@ class TranslationPipeline:
         self._auto_prepare_game_window()
         self._running = True
         self._empty_ticks = 0
+        self._idle_cycles = 0
         self.capturer.reset_state()
         self.hud_radar.reset()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -136,6 +140,43 @@ class TranslationPipeline:
             self.start()
         return self._running
 
+    def _translate_preserving_speaker(self, query_text: str) -> Tuple[str, str, bool, float]:
+        """
+        OverTranslate `SpeakerLineStart` / `SpeakerLabel` korumalı çeviri:
+        Metnin başında konuşmacı adı varsa (`"Michael: What are you doing?"`),
+        sadece konuşma gövdesini çevirir ve konuşmacı adını koruyarak birleştirir.
+        Dönüş: `(translated_text, provider_label, from_cache, translate_ms)`
+        """
+        speaker, body = DialogueTextGrouper.split_speaker_prefix(query_text)
+        target_body = body if speaker else query_text
+
+        cached = self.cache.get(
+            target_body,
+            target_lang=self.config.target_lang,
+            genre=self.config.game_genre,
+        )
+        if cached:
+            final_tr = f"{speaker}: {cached}" if speaker else cached
+            return final_tr, "SQLite Önbellek ⚡", True, 0.0
+
+        t_tr_start = time.perf_counter()
+        translated_body, provider_label = self.translator.translate(target_body)
+        tr_ms = (time.perf_counter() - t_tr_start) * 1000.0
+        if not translated_body or provider_label == "tr_ignored":
+            return "", provider_label, False, tr_ms
+
+        if not is_similar_text(target_body, translated_body, threshold=0.84):
+            self.cache.set(
+                source_text=target_body,
+                translated_text=translated_body,
+                provider=provider_label,
+                target_lang=self.config.target_lang,
+                genre=self.config.game_genre,
+            )
+
+        final_tr = f"{speaker}: {translated_body}" if speaker else translated_body
+        return final_tr, provider_label, False, tr_ms
+
     def process_single_frame(self, force: bool = True) -> Optional[TranslationEvent]:
         """Tek bir ekran karesini yakalar, okur ve çevirir."""
         t0 = time.perf_counter()
@@ -150,6 +191,7 @@ class TranslationPipeline:
         # Ekranda uzun süre (>= 12 kare / ~2.5 saniye) hiç altyazı kalmadıysa Türkçe altyazıyı gizle
         if not force and not self.capturer.subtitle_currently_visible:
             self._empty_ticks += 1
+            self._idle_cycles += 1
             if self._empty_ticks >= 12 and self._subtitle_shown:
                 self._subtitle_shown = False
                 self._last_ocr_text = ""
@@ -159,8 +201,10 @@ class TranslationPipeline:
             return None
 
         if img is None:
+            self._idle_cycles += 1
             return None
 
+        self._idle_cycles = 0
         t0 = time.perf_counter()
         t_ocr_start = t0
         raw_text = self.ocr.extract_text(img)
@@ -233,41 +277,13 @@ class TranslationPipeline:
 
         self._last_ocr_text = cleaned
         if is_joined_clause:
-            # İki yarım kart birleştirildikten sonra 3. kartın yanına yapışmaması için sıfırla
             self._prev_clause_text = ""
             self._prev_clause_time = 0.0
         else:
             self._prev_clause_text = cleaned
             self._prev_clause_time = now_ts
 
-        # 1. Önbellek kontrolü (0ms)
-        cached = self.cache.get(
-            query_text,
-            target_lang=self.config.target_lang,
-            genre=self.config.game_genre,
-        )
-        if cached:
-            if not force and is_similar_text(query_text, cached, threshold=0.84):
-                return None
-            self._subtitle_shown = True
-            latency = (time.perf_counter() - t0) * 1000.0
-            event = TranslationEvent(
-                source_text=query_text,
-                translated_text=cached,
-                provider="SQLite Önbellek ⚡",
-                from_cache=True,
-                latency_ms=latency,
-                ocr_ms=ocr_ms,
-                translate_ms=0.0,
-            )
-            if self.on_translation:
-                self.on_translation(event)
-            return event
-
-        # 2. Yapay Zeka Çevirisi
-        t_tr_start = time.perf_counter()
-        translated, provider_label = self.translator.translate(query_text)
-        tr_ms = (time.perf_counter() - t_tr_start) * 1000.0
+        translated, provider_label, from_cache, tr_ms = self._translate_preserving_speaker(query_text)
         if not translated or provider_label == "tr_ignored":
             return None
 
@@ -276,20 +292,12 @@ class TranslationPipeline:
             return None
 
         self._subtitle_shown = True
-
-        self.cache.set(
-            source_text=query_text,
-            translated_text=translated,
-            provider=provider_label,
-            target_lang=self.config.target_lang,
-            genre=self.config.game_genre,
-        )
         latency = (time.perf_counter() - t0) * 1000.0
         event = TranslationEvent(
             source_text=query_text,
             translated_text=translated,
             provider=provider_label,
-            from_cache=False,
+            from_cache=from_cache,
             latency_ms=latency,
             ocr_ms=ocr_ms,
             translate_ms=tr_ms,
@@ -300,7 +308,7 @@ class TranslationPipeline:
 
     def process_game_hud_frame(self, force_full_menu: bool = False) -> List[HUDTextPatch]:
         """
-        3 Filtreli Evrensel Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviricisi:
+        3 Filtreli + OverTranslate Doğal Doku Yamalı Evrensel Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviricisi:
         - SADECE gerçek bir oyun ön plandayken (veya Alt+M ile manuel tetiklendiğinde) çalışır;
           YouTube/tarayıcı videolarında devreye girmez!
         - Tarak Dişi Harf Ritmi + Pop-In Doğum + Dead-Zone Kilidi ile %0 FPS drop yaratır.
@@ -322,6 +330,9 @@ class TranslationPipeline:
             max_candidates=max_cands,
         )
 
+        if candidates:
+            self._idle_cycles = 0
+
         for box in candidates:
             raw_hud = self.ocr.extract_hud_crop_text(box.crop_rgb)
             if not raw_hud:
@@ -335,34 +346,17 @@ class TranslationPipeline:
                 patches_changed = True
                 continue
 
-            # 2. Genel HUD / Telefon / İpucu cümlesi kontrolü
+            # 2. Genel HUD / Telefon / İpucu cümlesi kontrolü (OverTranslate konuşmacı korumalı)
             cleaned = normalize_ocr_text(raw_hud)
             if not cleaned:
                 self.hud_radar.lock_dead_zone(box)
                 continue
 
-            cached = self.cache.get(
-                cleaned,
-                target_lang=self.config.target_lang,
-                genre=self.config.game_genre,
-            )
-            if cached:
-                self.hud_radar.register_patch(box, cleaned, cached)
-                patches_changed = True
-                continue
-
-            translated, prov = self.translator.translate(cleaned)
+            translated, prov, _from_cache, _tr_ms = self._translate_preserving_speaker(cleaned)
             if not translated or prov == "tr_ignored" or is_similar_text(cleaned, translated, threshold=0.86):
                 self.hud_radar.lock_dead_zone(box)
                 continue
 
-            self.cache.set(
-                source_text=cleaned,
-                translated_text=translated,
-                provider=prov,
-                target_lang=self.config.target_lang,
-                genre=self.config.game_genre,
-            )
             self.hud_radar.register_patch(box, cleaned, translated)
             patches_changed = True
 
@@ -392,6 +386,7 @@ class TranslationPipeline:
                         and is_game_active_in_foreground(self.target_hwnd)
                     ):
                         self._last_esc_time = now_t
+                        self._idle_cycles = 0
                         time.sleep(0.22)
                         self.process_game_hud_frame(force_full_menu=True)
                     elif tick_counter % 2 == 0 and self.config.enable_game_hud_radar:
@@ -399,7 +394,14 @@ class TranslationPipeline:
             except Exception as exc:
                 if self.on_status:
                     self.on_status(f"Hata: {exc}")
+
             elapsed = time.perf_counter() - t_start
-            interval_sec = max(0.18, float(self.config.scan_interval_ms) / 1000.0)
-            sleep_for = max(0.05, interval_sec - elapsed)
+            # OverTranslate `RealtimeBackgroundCadence` adaptif tarama hızı:
+            # Ekranda aktif konuşma/değişim varken hızlı (~140ms), sahne durgunken yumuşak (~240ms)
+            base_interval = max(0.14, float(self.config.scan_interval_ms) / 1000.0)
+            if self._idle_cycles >= 18:
+                adaptive_interval = min(0.26, base_interval * 1.35)
+            else:
+                adaptive_interval = base_interval
+            sleep_for = max(0.04, adaptive_interval - elapsed)
             time.sleep(sleep_for)
