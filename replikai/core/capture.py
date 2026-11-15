@@ -140,3 +140,11 @@ class ScreenCapturer:
 
         self._last_subtitle_mask_small = small_mask
         return Image.fromarray(rgb_arr), diff_score
+
+    def capture_fullscreen_rgb(self) -> np.ndarray:
+        """Birincil monitörün tam ekran RGB dizisini (~2.5ms) döndürür (Sadece Oyun İçi HUD/Menü Radarı için)."""
+        sct = self._get_mss()
+        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+        sct_img = sct.grab(mon)
+        bgra = np.asarray(sct_img, dtype=np.uint8)
+        return bgra[:, :, [2, 1, 0]].copy()

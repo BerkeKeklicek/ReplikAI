@@ -123,6 +123,7 @@ class AppConfig:
     overlay_bg_color: str = "#0B0E14"
     overlay_click_through: bool = True
     show_original_text: bool = False
+    enable_game_hud_radar: bool = True
 
     # Kısayollar
     hotkey_toggle_scan: str = "alt+t"
@@ -130,6 +131,7 @@ class AppConfig:
     hotkey_toggle_lock: str = "alt+l"
     hotkey_single_capture: str = "alt+c"
     hotkey_borderless: str = "alt+b"
+    hotkey_scan_menu: str = "alt+m"
 
     @classmethod
     def load(cls, path: Path = CONFIG_PATH) -> "AppConfig":

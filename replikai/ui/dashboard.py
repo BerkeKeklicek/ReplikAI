@@ -37,6 +37,7 @@ from replikai.core.game_window import (
     make_window_borderless_fullscreen,
 )
 from replikai.core.pipeline import TranslationEvent, TranslationPipeline
+from replikai.ui.hud_overlay import SpatialHUDOverlay
 from replikai.ui.overlay import SubtitleOverlay
 from replikai.ui.region_selector import RegionSelector
 
@@ -184,6 +185,7 @@ class BridgeSignals(QObject):
     """Arka plan iş parçacıkları ve kısayollar için Qt ana thread sinyal köprüsü."""
 
     translation_ready = Signal(object)
+    hud_patches_ready = Signal(object)
     status_changed = Signal(str)
     clear_subtitle = Signal()
     hotkey_toggle_scan = Signal()
@@ -191,14 +193,15 @@ class BridgeSignals(QObject):
     hotkey_toggle_lock = Signal()
     hotkey_single_capture = Signal()
     hotkey_borderless = Signal()
+    hotkey_scan_menu = Signal()
 
 
 class ReplikAIDashboard(QMainWindow):
-    """ReplikAI Pro v0.4 — Tam Otomatik Altyazı Komuta Merkezi."""
+    """ReplikAI Pro v0.4 — Tam Otomatik Altyazı & Evrensel Oyun HUD Komuta Merkezi."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ReplikAI Pro — Tam Otomatik Oyun Altyazı Çeviri Motoru")
+        self.setWindowTitle("ReplikAI Pro — Tam Otomatik Oyun Altyazı & HUD Çeviri Motoru")
         self.resize(1240, 810)
         self.setMinimumSize(1080, 720)
         self.setStyleSheet(PRO_STYLESHEET)
@@ -209,6 +212,7 @@ class ReplikAIDashboard(QMainWindow):
 
         self.signals = BridgeSignals()
         self.signals.translation_ready.connect(self._on_translation_ui)
+        self.signals.hud_patches_ready.connect(self._on_hud_patches_ui)
         self.signals.status_changed.connect(self._on_status_ui)
         self.signals.clear_subtitle.connect(self._on_clear_subtitle_ui)
         self.signals.hotkey_toggle_scan.connect(self.toggle_scanning)
@@ -216,12 +220,14 @@ class ReplikAIDashboard(QMainWindow):
         self.signals.hotkey_toggle_lock.connect(self.toggle_overlay_lock)
         self.signals.hotkey_single_capture.connect(self.trigger_single_capture)
         self.signals.hotkey_borderless.connect(self.apply_borderless_fullscreen_fix)
+        self.signals.hotkey_scan_menu.connect(self.trigger_full_menu_scan)
 
         self.pipeline = TranslationPipeline(
             config=self.config_data,
             on_translation=lambda ev: self.signals.translation_ready.emit(ev),
             on_status=lambda st: self.signals.status_changed.emit(st),
             on_clear=lambda: self.signals.clear_subtitle.emit(),
+            on_hud_patches=lambda patches: self.signals.hud_patches_ready.emit(patches),
         )
 
         self._quote_idx = 0
@@ -233,6 +239,7 @@ class ReplikAIDashboard(QMainWindow):
             self.config_data,
             on_region_moved=self._on_overlay_region_moved,
         )
+        self.hud_overlay = SpatialHUDOverlay()
         self._build_ui()
         self._register_hotkeys()
         self.refresh_game_window_list()
@@ -334,6 +341,12 @@ class ReplikAIDashboard(QMainWindow):
         self.btn_single_shot.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_single_shot.clicked.connect(self.trigger_single_capture)
         dock_v.addWidget(self.btn_single_shot)
+
+        self.btn_menu_scan = QPushButton("🗺️  Oyun Menüsü / HUD Çevir (Alt+M)")
+        self.btn_menu_scan.setObjectName("SecondaryBtn")
+        self.btn_menu_scan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_menu_scan.clicked.connect(self.trigger_full_menu_scan)
+        dock_v.addWidget(self.btn_menu_scan)
 
         self.btn_borderless = QPushButton("🖥️  Manuel Çerçevesiz Mod (Alt+B)")
         self.btn_borderless.setObjectName("SecondaryBtn")
@@ -693,6 +706,13 @@ class ReplikAIDashboard(QMainWindow):
         self.chk_show_orig.stateChanged.connect(self._on_overlay_sliders_changed)
         cv.addWidget(self.chk_show_orig)
 
+        self.chk_game_hud = QCheckBox(
+            "🎮 3 Filtreli Evrensel Oyun HUD, Bildirim, Telefon & ESC Menü Yerinde (In-Place) Çeviri (Sadece Oyunlarda Aktif)"
+        )
+        self.chk_game_hud.setChecked(bool(self.config_data.enable_game_hud_radar))
+        self.chk_game_hud.stateChanged.connect(self._on_overlay_sliders_changed)
+        cv.addWidget(self.chk_game_hud)
+
         layout.addWidget(card)
         layout.addStretch()
         return page
@@ -713,7 +733,8 @@ class ReplikAIDashboard(QMainWindow):
         hv.addWidget(QLabel("•  Alt + R  —  Oyundaki altyazı bölgesini fareyle seçer (HUD Bölge Seçici)"))
         hv.addWidget(QLabel("•  Alt + T  —  Gerçek zamanlı yakalama ve çeviri motorunu Başlatır / Durdurur"))
         hv.addWidget(QLabel("•  Alt + L  —  Hayalet Modu (Click-Through) Kilitler veya Taşıma için Açar"))
-        hv.addWidget(QLabel("•  Alt + C  —  Sürekli tarama kapalıyken ekrandaki kareyi tek tuşla çevirir"))
+        hv.addWidget(QLabel("•  Alt + C  —  Sürekli tarama kapalıyken ekrandaki altyazıyı tek tuşla çevirir"))
+        hv.addWidget(QLabel("•  Alt + M / ESC  —  Oyun içi ESC Menüsü, Harita, Telefon ve HUD yazılarını kelimenin tam üstünde (In-Place) çevirir"))
         layout.addWidget(hk_card)
 
         cache_card = QFrame()
@@ -822,6 +843,9 @@ class ReplikAIDashboard(QMainWindow):
         self.config_data.overlay_opacity = round(float(self.slider_opac.value()) / 100.0, 2)
         self.config_data.scan_interval_ms = int(self.slider_interval.value())
         self.config_data.show_original_text = bool(self.chk_show_orig.isChecked())
+        self.config_data.enable_game_hud_radar = bool(self.chk_game_hud.isChecked())
+        if not self.config_data.enable_game_hud_radar:
+            self.hud_overlay.clear_patches()
 
         self.lbl_font_val.setText(f"Altyazı Boyutu: {self.config_data.overlay_font_size} px")
         opac_pct = int(self.config_data.overlay_opacity * 100)
@@ -875,6 +899,9 @@ class ReplikAIDashboard(QMainWindow):
     def _on_clear_subtitle_ui(self) -> None:
         self.overlay.clear_subtitle()
 
+    def _on_hud_patches_ui(self, patches: list) -> None:
+        self.hud_overlay.set_patches(patches)
+
     def toggle_scanning(self) -> None:
         self.save_settings()
         # Çeviri başladığında ekranda çerçeve kalmaması için otomatik hayalet moda kilitle
@@ -925,6 +952,13 @@ class ReplikAIDashboard(QMainWindow):
         self.refresh_region_preview()
         threading.Thread(
             target=lambda: self.pipeline.process_single_frame(force=True),
+            daemon=True,
+        ).start()
+
+    def trigger_full_menu_scan(self) -> None:
+        self.save_settings()
+        threading.Thread(
+            target=lambda: self.pipeline.process_game_hud_frame(force_full_menu=True),
             daemon=True,
         ).start()
 
@@ -1060,6 +1094,10 @@ class ReplikAIDashboard(QMainWindow):
                 self.config_data.hotkey_borderless,
                 lambda: self.signals.hotkey_borderless.emit(),
             )
+            keyboard.add_hotkey(
+                self.config_data.hotkey_scan_menu,
+                lambda: self.signals.hotkey_scan_menu.emit(),
+            )
         except Exception:
             pass
 
@@ -1071,5 +1109,6 @@ class ReplikAIDashboard(QMainWindow):
             keyboard.unhook_all()
         except Exception:
             pass
+        self.hud_overlay.close()
         self.overlay.close()
         event.accept()

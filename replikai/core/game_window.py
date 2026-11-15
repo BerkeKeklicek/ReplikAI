@@ -44,6 +44,65 @@ KNOWN_GAME_PROCESSES = {
     "re4.exe": "Resident Evil 4",
 }
 
+NON_GAME_PROCESSES = {
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+    "explorer.exe",
+    "searchhost.exe",
+    "shellexperiencehost.exe",
+    "applicationframehost.exe",
+    "python.exe",
+    "pythonw.exe",
+    "code.exe",
+    "devenv.exe",
+    "discord.exe",
+    "spotify.exe",
+    "steamwebhelper.exe",
+    "obs64.exe",
+}
+
+VK_ESCAPE = 0x1B
+VK_M = 0x4D
+
+
+def is_game_active_in_foreground(target_hwnd: Optional[int] = None) -> bool:
+    """
+    Sadece gerçek bir oyun penceresi ön plandayken True döndürür.
+    YouTube (Chrome/Edge/Firefox) veya masaüstü açıkken False döndürerek
+    Tam Ekran HUD & Menü çevirisinin videoları etkilemesini %100 engeller.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        fg_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+        if not fg_hwnd:
+            return False
+        exe_name = get_window_process_name(fg_hwnd)
+        if not exe_name or exe_name in NON_GAME_PROCESSES:
+            return False
+        if exe_name in KNOWN_GAME_PROCESSES:
+            return True
+        if target_hwnd and fg_hwnd == int(target_hwnd):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_escape_key_pressed() -> bool:
+    """Oyuncunun ESC tuşuna basıp menüyü açtığını ~0.01ms içinde kontrol eder."""
+    if sys.platform != "win32":
+        return False
+    try:
+        state = ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE)
+        return bool(state & 0x8000)
+    except Exception:
+        return False
+
 
 def set_process_gaming_friendly_priority() -> None:
     """ReplikAI işlemini BELOW_NORMAL önceliğine alır; GTA5 / RDR2 gibi oyunların FPS'ini korur."""

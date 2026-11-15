@@ -120,3 +120,48 @@ def test_3d_background_subtitle_mask_filter() -> None:
     draw.text((40, 60), "Franklin, get in the car!", fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0))
     mask_sub = ScreenCapturer.extract_outlined_subtitle_mask(np.asarray(img))
     assert int(np.count_nonzero(mask_sub)) > 50
+
+
+def test_universal_3_filter_hud_radar() -> None:
+    from replikai.core.hud_radar import UniversalHUDRadar
+
+    radar = UniversalHUDRadar()
+    assert radar.lookup_instant_glossary("SETTINGS") == "AYARLAR"
+    assert radar.lookup_instant_glossary("MAP") == "HARİTA"
+
+    # 1. Kare (Baseline): Ekranda sabit bir 3D araba farı / beyaz duvar var (yazı değil)
+    base_frame = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+    base_frame[200:260, 400:520] = 245  # Tek parça parlak 3D obje (Tarak dişi filtresinden geçememeli!)
+    cands0, _ = radar.scan_for_new_hud_boxes(base_frame)
+    assert len(cands0) == 0
+
+    # 2. Kare (Pop-In Doğum): Sağ üst köşede aniden oyun içi bir bildirim kutusu ("Press E to interact") belirdi
+    hud_frame = base_frame.copy()
+    pil_hud = Image.fromarray(hud_frame)
+    draw = ImageDraw.Draw(pil_hud)
+    try:
+        font = ImageFont.truetype("arial.ttf", 28)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.rectangle([1380, 50, 1840, 115], fill=(16, 20, 28))
+    draw.text((1400, 65), "Press E to interact with vehicle", fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0), font=font)
+    hud_arr = np.asarray(pil_hud)
+
+    # Doğum karesi (t-1)
+    radar.scan_for_new_hud_boxes(hud_arr)
+    # Sabitlenme karesi (t): Yeni doğan ve sabit kalan sağ üst bildirim yakalanmalı!
+    cands_born, _ = radar.scan_for_new_hud_boxes(hud_arr)
+    assert len(cands_born) >= 1
+    top_right_box = cands_born[0]
+    assert top_right_box.x > 1200 and top_right_box.y < 200
+
+    # 3. Filtre (Dead-Zone Kilidi): Yamayı kaydettikten sonra oyuncu sabit dursa bile tekrar taranmamalı!
+    radar.register_patch(top_right_box, "Press E to interact with vehicle", "Araçla etkileşime geçmek için E'ye basın")
+    cands_still, _ = radar.scan_for_new_hud_boxes(hud_arr)
+    assert len(cands_still) == 0
+    assert len(radar.active_patches) == 1
+
+    # Bildirim ekrandan kalktığında Türkçe yama da otomatik silinmeli!
+    _, changed = radar.scan_for_new_hud_boxes(base_frame)
+    assert changed is True
+    assert len(radar.active_patches) == 0

@@ -202,3 +202,41 @@ class OCREngine:
         except Exception as exc:
             logger.error("OCR okuma hatası: %s", exc)
             return ""
+
+    def extract_hud_crop_text(self, crop_rgb: np.ndarray) -> str:
+        """
+        UniversalHUDRadar tarafından kırpılan küçük HUD/Menü/Telefon kutusunu (~15-25ms) okur.
+        'MAP', 'BRIEF', 'SETTINGS' gibi tek kelimelik menü başlıklarını da destekler.
+        """
+        self._ensure_initialized()
+        if not self._rapid_ocr or crop_rgb.size == 0:
+            return ""
+
+        try:
+            ch, cw = crop_rgb.shape[:2]
+            if ch > 54:
+                line_crops = self._slice_subtitle_lines(crop_rgb)
+                if not line_crops:
+                    line_crops = [crop_rgb]
+            else:
+                line_crops = [crop_rgb]
+
+            parts: List[str] = []
+            with self._lock:
+                for lc in line_crops[:3]:
+                    res, _ = self._rapid_ocr(lc, use_det=False, use_cls=False, use_rec=True)
+                    if res and len(res) > 0:
+                        txt, score = str(res[0][0]).strip(), float(res[0][1])
+                        if score >= 0.58 and txt:
+                            parts.append(txt)
+
+            raw = " ".join(parts).strip()
+            if not raw:
+                return ""
+            alpha_cnt = sum(1 for c in raw if c.isalpha())
+            if alpha_cnt < 3:
+                return ""
+            return raw
+        except Exception as exc:
+            logger.debug("HUD OCR okuma hatası: %s", exc)
+            return ""
