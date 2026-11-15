@@ -22,8 +22,8 @@ from PySide6.QtWidgets import QVBoxLayout, QLabel, QWidget
 
 from replikai.config import AppConfig
 from replikai.core.game_window import (
-    ensure_game_window_allows_overlay,
     exclude_window_from_capture,
+    map_region_to_game_window,
 )
 
 GWL_EXSTYLE = -20
@@ -176,10 +176,10 @@ class SubtitleOverlay(QWidget):
         self._auto_hide_timer.setSingleShot(True)
         self._auto_hide_timer.timeout.connect(self.clear_subtitle)
 
-        # Tam ekran video veya oyun açıldığında Z-Order'da en üstte kalmayı garantileyen zamanlayıcı
+        # Tam ekran video veya oyun açıldığında Z-Order'da en üstte kalmayı garantileyen zamanlayıcı (1000ms, sıfır lag)
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.ensure_topmost)
-        self._topmost_timer.start(250)
+        self._topmost_timer.start(1000)
 
         self._build_layout()
         self.sync_geometry_from_config()
@@ -194,11 +194,12 @@ class SubtitleOverlay(QWidget):
         return float(screen.devicePixelRatio()) if screen else 1.0
 
     def ensure_topmost(self) -> None:
-        """Tam ekran YouTube videosu veya oyun açıldığında oyunu HWND_NOTOPMOST yapıp overlay'i en üste taşır."""
+        """OverTranslate AlwaysOnTop.Reassert: Sadece kendi HWND'mizi odak çalmadan en üste taşır."""
         if sys.platform != "win32":
             return
         try:
-            ensure_game_window_allows_overlay()
+            if self.config.overlay_click_through:
+                self.sync_geometry_from_config()
             hwnd = int(self.winId())
             ctypes.windll.user32.SetWindowPos(
                 wintypes.HWND(hwnd),
@@ -207,20 +208,26 @@ class SubtitleOverlay(QWidget):
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
         except Exception:
             pass
 
     def sync_geometry_from_config(self) -> None:
-        """Fiziksel ekran piksellerini (`1920x1080`) Qt koordinatlarına çevirir."""
+        """Fiziksel ekran piksellerini (`1920x1080` veya aktif oyun penceresini) Qt koordinatlarına çevirir."""
         dpr = self.get_dpr()
-        reg = self.config.capture_region
+        reg = (
+            map_region_to_game_window(self.config.capture_region)
+            if self.config.overlay_click_through
+            else self.config.capture_region
+        )
         lx = int(round(reg.get("left", 260) / dpr))
         ly = int(round(reg.get("top", 790) / dpr))
         lw = max(200, int(round(reg.get("width", 1400) / dpr)))
         lh = max(60, int(round(reg.get("height", 220) / dpr)))
-        self.setGeometry(lx, ly, lw, lh)
+        cur = self.geometry()
+        if cur.x() != lx or cur.y() != ly or cur.width() != lw or cur.height() != lh:
+            self.setGeometry(lx, ly, lw, lh)
 
     def _save_geometry_to_config(self) -> None:
         """Kullanıcı kutuyu taşıdığında doğrudan Win32 fiziksel ekran koordinatlarını kaydeder."""

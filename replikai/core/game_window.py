@@ -1,4 +1,4 @@
-"""Win32 Oyun Penceresi Yöneticisi, Çerçevesiz Tam Ekran Dönüştürücü ve Yakalama İzolasyonu."""
+"""Win32 Oyun Penceresi Yöneticisi, Sıfır-Stutter Pencere Takipçisi ve Yakalama İzolasyonu."""
 
 from __future__ import annotations
 
@@ -24,6 +24,9 @@ SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
 SWP_NOZORDER = 0x0004
 SWP_NOOWNERZORDER = 0x0200
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOACTIVATE = 0x0010
 
 WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -91,6 +94,78 @@ def is_game_active_in_foreground(target_hwnd: Optional[int] = None) -> bool:
     except Exception:
         pass
     return False
+
+
+def get_active_game_window_rect(target_hwnd: Optional[int] = None) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Ön plandaki (veya hedef) oyun penceresinin fiziksel ekran koordinatlarını `(left, top, width, height)` döndürür.
+    Oyun pencere modundaysa (ör. 1536x864 veya 1280x720) altyazı yakalama ve overlay konumunu
+    otomatik olarak oyun penceresinin içine hizalamak için kullanılır.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(user32.GetForegroundWindow())
+        exe_name = get_window_process_name(hwnd) if hwnd else ""
+        if exe_name not in KNOWN_GAME_PROCESSES:
+            if target_hwnd and user32.IsWindowVisible(wintypes.HWND(int(target_hwnd))):
+                hwnd = int(target_hwnd)
+            else:
+                return None
+
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        w = int(rect.right - rect.left)
+        h = int(rect.bottom - rect.top)
+        if w < 400 or h < 300:
+            return None
+        return int(rect.left), int(rect.top), w, h
+    except Exception:
+        return None
+
+
+def map_region_to_game_window(
+    base_region: Dict[str, int],
+    target_hwnd: Optional[int] = None,
+) -> Dict[str, int]:
+    """
+    Eğer aktif oyun penceresi ekranın tamamından küçükse (ör. 1536x864 pencere modu),
+    altyazı kutusunun oyun penceresinin dışına (masaüstüne/görev çubuğuna) taşmaması için
+    koordinatları oyun penceresinin alt-orta kısmına otomatik ölçekler.
+    Tam ekran (1920x1080) modda ise kullanıcının `base_region` koordinatlarını olduğu gibi korur.
+    """
+    if sys.platform != "win32":
+        return dict(base_region)
+    try:
+        game_rect = get_active_game_window_rect(target_hwnd)
+        if not game_rect:
+            return dict(base_region)
+        gx, gy, gw, gh = game_rect
+        user32 = ctypes.windll.user32
+        screen_w = max(1, int(user32.GetSystemMetrics(0)))
+        screen_h = max(1, int(user32.GetSystemMetrics(1)))
+
+        # Oyun zaten tam ekransa (1920x1080) orijinal bölgeyi doğrudan kullan
+        if gw >= screen_w - 16 and gh >= screen_h - 16 and abs(gx) <= 8 and abs(gy) <= 8:
+            return dict(base_region)
+
+        # Oyun daha küçük bir penceredeyse (ör. 1536x864), 1920x1080 oranlarını oyun penceresine uyarla
+        sx = float(gw) / float(screen_w)
+        sy = float(gh) / float(screen_h)
+        new_left = gx + int(round(base_region.get("left", 260) * sx))
+        new_top = gy + int(round(base_region.get("top", 790) * sy))
+        new_w = max(240, int(round(base_region.get("width", 1400) * sx)))
+        new_h = max(70, int(round(base_region.get("height", 220) * sy)))
+        return {
+            "left": max(0, new_left),
+            "top": max(0, new_top),
+            "width": new_w,
+            "height": new_h,
+        }
+    except Exception:
+        return dict(base_region)
 
 
 def is_escape_key_pressed() -> bool:
@@ -178,8 +253,6 @@ def list_candidate_game_windows() -> List[Tuple[int, str, str]]:
         return True
 
     user32.EnumWindows(WNDENUMPROC(_callback), 0)
-
-    # Bilinen oyunları listenin en üstüne taşı
     results.sort(key=lambda item: (0 if item[2] in KNOWN_GAME_PROCESSES else 1, item[1].lower()))
     return results
 
@@ -194,9 +267,9 @@ def auto_detect_running_game() -> Optional[Tuple[int, str, str]]:
 
 def make_window_borderless_fullscreen(hwnd: Optional[int] = None) -> Tuple[bool, str]:
     """
-    Hedef oyun penceresini (veya aktif ön plan oyununu) Çerçevesiz Tam Ekran (Borderless Windowed)
-    moduna geçirir. GTA 5 ve RDR 2'de Exclusive Fullscreen kaynaklı 'masaüstünü okuma' ve
-    'overlay görünmeme' sorununu tek tuşla çözer.
+    SADECE kullanıcı arayüzdeki butona manuel tıkladığında çağrılır.
+    Oyunun çözünürlüğünü bozmamak için tam ekran boyutunu (`screen_w x screen_h`, ör. 1920x1080)
+    kullanır (`screen_h - 1` KULLANMAZ, böylece GTA 5 1536x864 pencereye küçülmez ve kasmaz!).
     """
     if sys.platform != "win32":
         return False, "Sadece Windows desteklenir."
@@ -231,80 +304,27 @@ def make_window_borderless_fullscreen(hwnd: Optional[int] = None) -> Tuple[bool,
         new_style |= WS_POPUP | WS_VISIBLE
         user32.SetWindowLongW(target_hwnd, GWL_STYLE, new_style)
 
-        # KRİTİK: Oyunun WS_EX_TOPMOST bayrağını kaldır ve HWND_NOTOPMOST (-2) katmanına indir.
-        # Ayrıca yüksekliği `screen_h - 1` (ör. 1920x1079) yaparak Windows 10/11 DXGI DirectFlip /
-        # Independent Flip donanım bypass modunu %100 devre dışı bırak! (Tam 1920x1080 olduğunda
-        # DirectX tüm masaüstü overlay pencerelerini arkaya atar ve sadece Alt+Tab'da görünür!)
-        WS_EX_TOPMOST_FLAG = 0x00000008
         HWND_NOTOPMOST = -2
-        SWP_NOACTIVATE = 0x0010
-        ex_style = user32.GetWindowLongW(target_hwnd, GWL_EXSTYLE)
-        if ex_style & WS_EX_TOPMOST_FLAG:
-            user32.SetWindowLongW(target_hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_TOPMOST_FLAG)
-
         user32.SetWindowPos(
             wintypes.HWND(target_hwnd),
             wintypes.HWND(HWND_NOTOPMOST),
             0,
             0,
             screen_w,
-            max(600, screen_h - 1),
+            screen_h,
             SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
         )
-        return True, f"{exe_name or 'Oyun'} DWM Overlay Uyumlu Çerçevesiz Tam Ekran ({screen_w}x{screen_h - 1}) yapıldı!"
+        return True, f"{exe_name or 'Oyun'} Çerçevesiz Tam Ekran ({screen_w}x{screen_h}) yapıldı!"
     except Exception as exc:
         return False, f"Pencere dönüştürme hatası: {exc}"
 
 
 def ensure_game_window_allows_overlay(target_hwnd: Optional[int] = None) -> None:
     """
-    GTA 5 / RDR 2 ön plana geçtiğinde kendi kendine tekrar WS_EX_TOPMOST veya tam 1920x1080
-    Independent Flip moduna geçerse, oyunu anında HWND_NOTOPMOST (screen_h - 1) katmanında tutar.
-    Böylece çeviri yazıları Alt+Tab atmaya gerek kalmadan DOĞRUDAN OYUN EKRANININ ÜSTÜNDE görünür!
+    OverTranslate `AlwaysOnTop` prensibi:
+    Oyun penceresinin boyutuna, çözünürlüğüne veya `GWL_STYLE` bayraklarına ASLA dokunmaz!
+    (Oyun penceresine dışarıdan `SetWindowLongW` veya `SWP_FRAMECHANGED` göndermek GTA 5'i
+    kendi kendine 1536x864 pencere moduna düşürür ve DirectX swapchain takılmasına / FPS drop'a yol açar).
+    Bunun yerine sadece kendi overlay penceremizin `HWND_TOPMOST` bayrağı yenilenir.
     """
-    if sys.platform != "win32":
-        return
-    try:
-        user32 = ctypes.windll.user32
-        fg_hwnd = int(user32.GetForegroundWindow())
-        if not fg_hwnd:
-            return
-        exe_name = get_window_process_name(fg_hwnd)
-        is_target_game = (exe_name in KNOWN_GAME_PROCESSES) or (target_hwnd and fg_hwnd == int(target_hwnd))
-        if not is_target_game or exe_name in NON_GAME_PROCESSES:
-            return
-
-        WS_EX_TOPMOST_FLAG = 0x00000008
-        HWND_NOTOPMOST = -2
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOACTIVATE = 0x0010
-
-        screen_w = user32.GetSystemMetrics(0)
-        screen_h = user32.GetSystemMetrics(1)
-        rect = wintypes.RECT()
-        user32.GetWindowRect(wintypes.HWND(fg_hwnd), ctypes.byref(rect))
-        win_w = int(rect.right - rect.left)
-        win_h = int(rect.bottom - rect.top)
-
-        ex_style = user32.GetWindowLongW(wintypes.HWND(fg_hwnd), GWL_EXSTYLE)
-        has_topmost = bool(ex_style & WS_EX_TOPMOST_FLAG)
-        is_exact_fullscreen = (win_w == screen_w and win_h == screen_h and rect.left == 0 and rect.top == 0)
-
-        if has_topmost or is_exact_fullscreen:
-            style = user32.GetWindowLongW(wintypes.HWND(fg_hwnd), GWL_STYLE)
-            new_style = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)) | WS_POPUP | WS_VISIBLE
-            user32.SetWindowLongW(wintypes.HWND(fg_hwnd), GWL_STYLE, new_style)
-            if has_topmost:
-                user32.SetWindowLongW(wintypes.HWND(fg_hwnd), GWL_EXSTYLE, ex_style & ~WS_EX_TOPMOST_FLAG)
-            user32.SetWindowPos(
-                wintypes.HWND(fg_hwnd),
-                wintypes.HWND(HWND_NOTOPMOST),
-                0,
-                0,
-                screen_w,
-                max(600, screen_h - 1),
-                SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-            )
-    except Exception:
-        pass
+    return

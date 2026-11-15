@@ -1,21 +1,16 @@
 """3 Filtreli Evrensel Oyun HUD, Bildirim, Telefon ve ESC Menü Radarı (~0.9ms CPU, Sıfır FPS-Drop).
 
-MİMARİ (3 Matematiksel Filtre + OverTranslate Entegrasyonu):
-1. Tarak Dişi Yatay Harf Ritmi (Sobel-X + Top-Hat Comb Filter):
-   3D dünyadaki araba farı, direk, bina ve çit gibi tek parça objeleri eler;
-   sadece yan yana dizilmiş 'Harf-Boşluk-Harf' yatay geçiş ritmine sahip gerçek yazıları geçirir.
-2. Aniden Doğma ve Mıh Gibi Sabit Kalma (Pop-In Birth & Temporal Anchor):
-   Oyuncu sabit durduğunda zaten ekranda olan 3D objeleri ASLA taramaz. Sadece bir önceki
-   karede orada yokken aniden sıfırdan beliren (0 -> 1) ve kaymadan aynı pikselde sabit kalan
-   (1 -> 1) yeni oyun içi bildirim/ipucu/telefon/menü yazılarını yakalar.
-3. Bir Kez Bak ve Unut (Dead-Zone Kilidi):
-   Taranan bir koordinat (yazı olsun veya olmasın) pikselleri değişmediği sürece kilitlenir;
-   oyuncu aynı yerde saatlerce dursa bile tekrar taranmaz (%0 CPU). Oyun bildirimi kapattığı an
-   üstündeki Türkçe yama da otomatik silinir.
-4. OverTranslate `DialogueTextGrouper` + `RealtimeNaturalBackground` + `SourceTextColorSampler`:
-   - Çok satırlı bildirim/ipucu paragraflarını geometrik hizayla tek kutuda birleştirir (menü maddelerini ayrı tutar).
-   - Orijinal İngilizce harfleri düz kutu yerine doğal arka plan doku yaması (`Inpainting`) ile siler
-     ve oyunun orijinal harf rengini + konturunu WCAG 2.0 kontrastıyla korur.
+MİMARİ:
+1. Çift Kanallı Tarak Dişi Yatay Harf Ritmi (`th_max` + `th_min` + `local_drop` Comb Filter):
+   Hem karanlık sahnelerdeki hem de gri menü sekmelerindeki (`STATS | SETTINGS | GAME`) ve
+   parlak bulanık arka planlardaki (`You are through to...`) tüm harfleri eksiksiz yakalar.
+2. Tam Satır Bütünlüğü (`cur_comb` Connected Components):
+   Cümle kutularını fark maskesinden değil doğrudan `cur_comb` üzerinden çıkarır; böylece
+   uzun bir cümlenin sadece ortasını çevirip başını/sonunu açıkta bırakma hatası %100 önlenir!
+3. Sıkı Harf Kutusu (`tight_bounds`) & `32x12` Parmak İzi Takibi:
+   - Telefondaki `DIALING...` yazısının yanındaki kişi fotoğrafını (Devin) yama kutusuna dahil etmez.
+   - `DIALING...` yazısı `CONNECTED` olduğunda piksel sayısı aynı kalsa bile `32x12` parmak izi
+     farkıyla anında algılar ve `ARANIYOR...` -> `BAĞLANDI` olarak günceller.
 """
 
 from __future__ import annotations
@@ -30,7 +25,7 @@ import numpy as np
 from replikai.core.dialogue_grouper import DialogueTextGrouper
 from replikai.core.natural_patch import RealtimeNaturalBackground, SourceTextColorSampler
 
-# Tek kelimelik veya yaygın oyun menü/HUD başlıkları için 0.0 ms anlık sözlük
+# Tek kelimelik veya yaygın oyun menü/HUD/telefon başlıkları için 0.0 ms anlık sözlük
 HUD_INSTANT_GLOSSARY: Dict[str, str] = {
     "map": "HARİTA",
     "brief": "ÖZET",
@@ -52,6 +47,9 @@ HUD_INSTANT_GLOSSARY: Dict[str, str] = {
     "camera": "KAMERA",
     "saving and startup": "KAYIT VE BAŞLANGIÇ",
     "notifications": "BİLDİRİMLER",
+    "dialogue": "DİYALOGLAR",
+    "help": "YARDIM",
+    "feed": "AKIŞ",
     "resume": "DEVAM ET",
     "save game": "OYUNU KAYDET",
     "load game": "OYUN YÜKLE",
@@ -65,6 +63,13 @@ HUD_INSTANT_GLOSSARY: Dict[str, str] = {
     "internet": "İNTERNET",
     "snapmatic": "KAMERA",
     "securoserv": "SECUROSERV",
+    "dialing": "ARANIYOR...",
+    "dialing...": "ARANIYOR...",
+    "connected": "BAĞLANDI",
+    "busy": "MEŞGUL",
+    "no answer": "CEVAP YOK",
+    "call ended": "ARAMA BİTTİ",
+    "voicemail": "SESLİ MESAJ",
     "inventory": "ENVANTER",
     "journal": "GÜNLÜK",
     "quests": "GÖREVLER",
@@ -73,7 +78,6 @@ HUD_INSTANT_GLOSSARY: Dict[str, str] = {
     "player": "OYUNCU",
     "progress": "İLERLEME",
     "story": "HİKAYE",
-    "help": "YARDIM",
     "general": "GENEL",
     "mission passed": "GÖREV TAMAMLANDI",
     "mission failed": "GÖREV BAŞARISIZ",
@@ -85,7 +89,7 @@ HUD_INSTANT_GLOSSARY: Dict[str, str] = {
 
 @dataclass
 class HUDCandidateBox:
-    """Radarın tespit ettiği, OCR'a girecek küçük oyun içi yazı kutusu."""
+    """Radarın tespit ettiği, OCR'a girecek oyun içi yazı kutusu."""
 
     zone_key: str
     x: int
@@ -114,7 +118,9 @@ class HUDTextPatch:
     text_rgb: Tuple[int, int, int]
     comb_energy: int
     outline_rgb: Tuple[int, int, int] = (10, 14, 20)
+    num_lines: int = 1
     natural_bg_patch: Optional[np.ndarray] = field(default=None, repr=False)
+    fingerprint: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 class UniversalHUDRadar:
@@ -127,14 +133,9 @@ class UniversalHUDRadar:
     COARSE_H = 270
 
     def __init__(self) -> None:
-        # 1. Filtre için zaman durumları: baseline (t-2), prev (t-1)
         self._baseline_comb: Optional[np.ndarray] = None
         self._prev_comb: Optional[np.ndarray] = None
-
-        # 3. Filtre (Dead-Zone Kilidi): zone_key -> son bilinen comb enerjisi
         self._dead_zones: Dict[str, int] = {}
-
-        # Aktif olarak ekranda gösterilen yerinde (In-Place) Türkçe yamalar
         self.active_patches: Dict[str, HUDTextPatch] = {}
 
     def reset(self) -> None:
@@ -143,37 +144,43 @@ class UniversalHUDRadar:
         self._dead_zones.clear()
         self.active_patches.clear()
 
+    @staticmethod
+    def _compute_fingerprint(rgb_patch: np.ndarray) -> Optional[np.ndarray]:
+        if rgb_patch is None or rgb_patch.size == 0:
+            return None
+        return cv2.resize(rgb_patch, (32, 12), interpolation=cv2.INTER_AREA).astype(np.float32)
+
     @classmethod
     def compute_comb_text_mask(cls, full_rgb: np.ndarray, subtitle_region: Optional[Dict[str, int]] = None) -> np.ndarray:
         """
-        2. FİLTRE — TARAK DİŞİ YATAY HARF RİTMİ (0.4ms):
-        Tam ekranı 480x270'e küçültür; hem ince konturlu (Top-Hat) hem de yatay eksende
-        yüksek frekanslı 'Harf-Boşluk-Harf' (Sobel-X tarak dişi) geçişine sahip pikselleri bulur.
-        Tek parça 3D objeler (araba farı, bina duvarı, direk, gökyüzü) bu filtreden geçemez!
+        ÇİFT KANALLI TARAK DİŞİ YATAY HARF RİTMİ (0.4ms):
+        - Hem gri menü sekmelerini (`STATS | SETTINGS | GAME`), hem parlak bulanık menü arka planı
+          üzerindeki beyaz yazıları (`You are through to...`), hem de koyu kutulu HUD bildirimlerini yakalar.
         """
         fh, fw = full_rgb.shape[:2]
         small = cv2.resize(full_rgb, (cls.COARSE_W, cls.COARSE_H), interpolation=cv2.INTER_AREA)
         max_c = np.max(small, axis=2)
+        min_c = np.min(small, axis=2)
 
-        # İnce harf darbelerini yakalayan 7x7 Top-Hat
         kernel_th = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        tophat = cv2.morphologyEx(max_c, cv2.MORPH_TOPHAT, kernel_th)
+        th_max = cv2.morphologyEx(max_c, cv2.MORPH_TOPHAT, kernel_th)
+        th_min = cv2.morphologyEx(min_c, cv2.MORPH_TOPHAT, kernel_th)
+        tophat = np.maximum(th_max, th_min)
 
-        # Koyu kontur veya koyu HUD kutusu komşuluğu
-        dark_bg = (max_c < 88).astype(np.uint8) * 255
-        near_dark = cv2.dilate(dark_bg, np.ones((3, 3), np.uint8), iterations=1)
+        # Yerel kontrast düşüşü (3x3 komşulukta harf-arka plan farkı >= 36)
+        local_min = cv2.erode(min_c, np.ones((3, 3), np.uint8), iterations=1)
+        local_drop = max_c.astype(np.int16) - local_min.astype(np.int16)
 
-        # Tarak Dişi (Comb) Yatay Harf Geçiş Yoğunluğu: |I(x+1) - I(x)| > 36
+        # Tarak Dişi (Comb) Yatay Harf Geçiş Yoğunluğu: |I(x+1) - I(x)| > 26
         dx = np.abs(np.diff(max_c.astype(np.int16), axis=1, append=0))
-        horiz_edges = (dx > 36).astype(np.uint8)
-        # 11x3 yatay pencerede en az 5 harf kenarı geçişi olmalı (yan yana harf dizisi şartı!)
-        edge_density = cv2.boxFilter(horiz_edges, ddepth=-1, ksize=(11, 3), normalize=False)
+        horiz_edges = (dx > 26).astype(np.uint8)
+        edge_density = cv2.boxFilter(horiz_edges, ddepth=-1, ksize=(9, 3), normalize=False)
 
         comb_mask = (
-            (tophat > 48)
-            & (max_c > 145)
-            & (near_dark > 0)
-            & (edge_density >= 5)
+            (tophat > 28)
+            & (max_c > 140)
+            & (local_drop > 36)
+            & (edge_density >= 4)
         ).astype(np.uint8) * 255
 
         # Alt orta altyazı bölgesini maskeden çıkar (orayı zaten SubtitleOverlay çeviriyor)
@@ -190,15 +197,11 @@ class UniversalHUDRadar:
 
     @staticmethod
     def _make_zone_key(x: int, y: int, w: int, h: int) -> str:
-        """Koordinatı 24px ızgaraya yuvarlayarak kararlı bölge anahtarı üretir."""
-        return f"{x // 24}_{y // 24}_{w // 32}_{h // 20}"
+        """Koordinatı 20px ızgaraya yuvarlayarak kararlı bölge anahtarı üretir."""
+        return f"{x // 20}_{y // 20}_{w // 28}_{h // 16}"
 
     @staticmethod
     def sample_box_colors(crop_rgb: np.ndarray) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-        """
-        OverTranslate `SourceTextColorSampler` + `OverlayTextColor` kullanarak
-        arka plan rengini (`bg_rgb`) ve WCAG/HSL ayarlı harf rengini (`text_rgb`) döndürür.
-        """
         style = SourceTextColorSampler.sample(crop_rgb)
         return style.background_rgb, style.text_rgb
 
@@ -210,16 +213,14 @@ class UniversalHUDRadar:
     ) -> List[Tuple[int, int, int, int, int]]:
         """
         OverTranslate `DialogueTextGrouper` kurallarıyla:
-        1. Aynı satırdaki yan yana kelimeleri (`adjacent_in_row`) birleştirir.
-        2. Alt alta dizilmiş paragraf satırlarını (`next_paragraph_row` — ör. GTA 5 sol üst 3 satırlık
-           bilgi kutusu) tek bir paragraf kutusunda birleştirir; menü maddelerini ise ayrı tutar!
-        Girdi/Çıktı elemanları: `(x, y, w, h, comb_energy)`
+        1. Aynı satırdaki yan yana kelimeleri (`adjacent_in_row`) birleştirir;
+           ancak `STATS | SETTINGS | GAME` gibi aralarında geniş boşluk olan sekmeleri ayrı tutar.
+        2. Alt alta dizilmiş paragraf satırlarını (`next_paragraph_row`) tek kutuda birleştirir.
         """
         if len(raw_rects) <= 1:
             return raw_rects
 
-        # 1. Yatayda aynı satırdaki yakın kelime parçalarını birleştir
-        sorted_h = sorted(raw_rects, key=lambda r: (r[1] // 16, r[0]))
+        sorted_h = sorted(raw_rects, key=lambda r: (r[1] // 14, r[0]))
         row_merged: List[Tuple[int, int, int, int, int]] = []
         for rect in sorted_h:
             rx, ry, rw, rh, renergy = rect
@@ -234,15 +235,13 @@ class UniversalHUDRadar:
                     continue
             row_merged.append(rect)
 
-        # 2. Dikeyde aynı paragrafın devamı olan satırları (`next_paragraph_row`) birleştir
         sorted_v = sorted(row_merged, key=lambda r: (r[1], r[0]))
         groups: List[List[Tuple[int, int, int, int, int]]] = []
         for rect in sorted_v:
             rx, ry, rw, rh, _ = rect
             placed = False
             for grp in groups:
-                # Paragraf en fazla 4 satır yüksekliğinde olabilir (dev menü listelerini yutmaması için)
-                if len(grp) >= 4:
+                if len(grp) >= 3:
                     continue
                 px, py, pw, ph, _ = grp[-1]
                 if DialogueTextGrouper.next_paragraph_row((px, py, pw, ph), (rx, ry, rw, rh)):
@@ -270,13 +269,6 @@ class UniversalHUDRadar:
         force_full_menu: bool = False,
         max_candidates: int = 8,
     ) -> Tuple[List[HUDCandidateBox], bool]:
-        """
-        3 Filtreli + OverTranslate Gruplamalı tarama yapar:
-        1. Ekrandan kaybolan eski HUD/menü bildirimlerini `active_patches` listesinden siler.
-        2. Sadece yeni doğup sabitlenen (`Pop-In + Stationary`) ve `Dead-Zone` kilidinde olmayan
-           gerçek yazı kutularını döndürür.
-        Dönüş: `(yeni_aday_kutular, mevcut_yamalar_degisti_mi)`
-        """
         fh, fw = full_rgb.shape[:2]
         cur_comb = self.compute_comb_text_mask(full_rgb, subtitle_region)
         patches_changed = False
@@ -284,7 +276,7 @@ class UniversalHUDRadar:
         sx = fw / float(self.COARSE_W)
         sy = fh / float(self.COARSE_H)
 
-        # A) Mevcut aktif Türkçe yamaların altındaki oyun yazısı kapandı mı kontrol et
+        # A) Mevcut aktif Türkçe yamaların altındaki oyun yazısı kapandı mı veya değişti mi (`DIALING...` -> `CONNECTED`) kontrol et!
         stale_keys: List[str] = []
         for zkey, patch in list(self.active_patches.items()):
             cx1 = max(0, int(patch.x / sx))
@@ -292,8 +284,21 @@ class UniversalHUDRadar:
             cx2 = min(self.COARSE_W, max(cx1 + 2, int((patch.x + patch.w) / sx)))
             cy2 = min(self.COARSE_H, max(cy1 + 2, int((patch.y + patch.h) / sy)))
             current_energy = int(np.count_nonzero(cur_comb[cy1:cy2, cx1:cx2]))
-            # Alttaki oyun bildirimi/menüsü kapandıysa veya tamamen değiştiyse yamayı kaldır
-            if current_energy < max(3, int(patch.comb_energy * 0.38)) or current_energy > int(patch.comb_energy * 2.2):
+
+            is_stale = (
+                current_energy < max(3, int(patch.comb_energy * 0.38))
+                or current_energy > int(patch.comb_energy * 2.1)
+            )
+            # Parmak izi (32x12) kontrolü: Kelime değiştiyse (ör. DIALING... -> CONNECTED) anında algıla!
+            if not is_stale and patch.fingerprint is not None:
+                cur_crop = full_rgb[max(0, patch.y) : min(fh, patch.y + patch.h), max(0, patch.x) : min(fw, patch.x + patch.w)]
+                cur_fp = self._compute_fingerprint(cur_crop)
+                if cur_fp is not None and cur_fp.shape == patch.fingerprint.shape:
+                    l1_diff = float(np.mean(np.abs(cur_fp - patch.fingerprint)))
+                    if l1_diff > 13.5:
+                        is_stale = True
+
+            if is_stale:
                 stale_keys.append(zkey)
                 self._dead_zones.pop(zkey, None)
 
@@ -301,41 +306,36 @@ class UniversalHUDRadar:
             self.active_patches.pop(k, None)
             patches_changed = True
 
-        # B) Dead-Zone kilitlerinde pikseli boşalan yerlerin kilidini aç
+        # B) Dead-Zone kilitlerinde pikseli değişen yerlerin kilidini aç
         for dkey, old_energy in list(self._dead_zones.items()):
             parts = dkey.split("_")
             if len(parts) == 4:
                 gx, gy, gw, gh = (int(p) for p in parts)
-                cx1 = max(0, int((gx * 24) / sx))
-                cy1 = max(0, int((gy * 24) / sy))
-                cx2 = min(self.COARSE_W, max(cx1 + 2, int(((gx * 24) + (gw * 32)) / sx)))
-                cy2 = min(self.COARSE_H, max(cy1 + 2, int(((gy * 24) + (gh * 20)) / sy)))
+                cx1 = max(0, int((gx * 20) / sx))
+                cy1 = max(0, int((gy * 20) / sy))
+                cx2 = min(self.COARSE_W, max(cx1 + 2, int(((gx * 20) + (gw * 28)) / sx)))
+                cy2 = min(self.COARSE_H, max(cy1 + 2, int(((gy * 20) + (gh * 16)) / sy)))
                 cur_e = int(np.count_nonzero(cur_comb[cy1:cy2, cx1:cx2]))
-                if abs(cur_e - old_energy) > max(6, int(old_energy * 0.45)):
+                if abs(cur_e - old_energy) > max(5, int(old_energy * 0.40)):
                     self._dead_zones.pop(dkey, None)
 
-        # İlk karelerde referans maskeleri doldur
         if self._baseline_comb is None or self._prev_comb is None:
             self._baseline_comb = cur_comb.copy()
             self._prev_comb = cur_comb.copy()
             if not force_full_menu:
                 return [], patches_changed
 
-        # 1. FİLTRE: Aniden Doğma ve Sabit Kalma (Pop-In Birth + Stationary)
         if force_full_menu:
-            # ESC / Menü tuşuna basıldığında ekrandaki tüm sabit tarak-dişi yazılarını tek seferde al
-            target_mask = cur_comb
+            born_mask = cur_comb
         else:
             prev_dilated = cv2.dilate(self._prev_comb, np.ones((3, 3), np.uint8), iterations=1)
             base_dilated = cv2.dilate(self._baseline_comb, np.ones((5, 5), np.uint8), iterations=1)
-            born_and_stationary = (
+            born_mask = (
                 (cur_comb > 0)
                 & (prev_dilated > 0)
                 & (base_dilated == 0)
             ).astype(np.uint8) * 255
-            target_mask = born_and_stationary
 
-        # Bir sonraki tur için sabitlenen pikselleri baseline'a aktar (Dead-Zone & 3D sahne hafızası)
         stable_now = ((cur_comb > 0) & (self._prev_comb > 0)).astype(np.uint8) * 255
         self._baseline_comb = cv2.bitwise_or(
             cv2.bitwise_and(self._baseline_comb, cur_comb),
@@ -343,21 +343,19 @@ class UniversalHUDRadar:
         )
         self._prev_comb = cur_comb.copy()
 
-        if int(np.count_nonzero(target_mask)) < 8:
+        if int(np.count_nonzero(born_mask)) < 6:
             return [], patches_changed
 
-        # Kelime/satır kutularını birleştir ve baş/son harflerin kesilmemesi için yatayda 6px genişlet
-        connected = cv2.morphologyEx(
-            target_mask,
+        # KRİTİK: Bağlantılı bileşenleri `born_mask` yerine doğrudan `cur_comb` üzerinden çıkar!
+        # Böylece cümlenin bir kısmı eski bir 3D objenin üstüne denk gelse bile cümle ASLA ortadan bölünmez!
+        # Yatay kapatmayı (10, 2) tutuyoruz ki aynı cümledeki kelimeler birleşsin ama menü sekmeleri
+        # (STATS | SETTINGS | GAME) ve telefon ikonları birbirine yapışmasın!
+        connected_full = cv2.morphologyEx(
+            cur_comb,
             cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (16, 3)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (10, 2)),
         )
-        connected = cv2.dilate(
-            connected,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (6, 2)),
-            iterations=1,
-        )
-        num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(connected, connectivity=8)
+        num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(connected_full, connectivity=8)
 
         raw_rects: List[Tuple[int, int, int, int, int]] = []
         for i in range(1, num_labels):
@@ -366,16 +364,20 @@ class UniversalHUDRadar:
             cw = int(stats[i, cv2.CC_STAT_WIDTH])
             ch = int(stats[i, cv2.CC_STAT_HEIGHT])
 
-            # Gerçek bir kelime/bildirim kutusu boyutu kontrolü (coarse 480x270 ölçekte)
-            if cw < 9 or cw > 320 or ch < 3 or ch > 65:
+            if cw < 7 or cw > 410 or ch < 3 or ch > 65:
+                continue
+
+            # Bu bileşenin içinde yeni doğan (`born_mask`) harf enerjisi var mı?
+            born_energy = int(np.count_nonzero(born_mask[cy : cy + ch, cx : cx + cw]))
+            if not force_full_menu and born_energy < 5:
                 continue
 
             comb_energy = int(np.count_nonzero(cur_comb[cy : cy + ch, cx : cx + cw]))
-            if comb_energy < 7:
+            if comb_energy < 6:
                 continue
 
-            # Gerçek ekran koordinatlarına (1920x1080) çevir (sol/sağ ilk-son harf payı pad_x=18)
-            pad_x, pad_y = 18, 6
+            # Sıkı başlangıç koordinatları (telefondaki kişi fotoğrafına taşmaması için pad_x=8, pad_y=4)
+            pad_x, pad_y = 8, 4
             rx1 = max(0, int(cx * sx) - pad_x)
             ry1 = max(0, int(cy * sy) - pad_y)
             rx2 = min(fw, int((cx + cw) * sx) + pad_x)
@@ -383,18 +385,16 @@ class UniversalHUDRadar:
             rw = rx2 - rx1
             rh = ry2 - ry1
 
-            if rw < 36 or rh < 14:
+            if rw < 28 or rh < 12:
                 continue
 
             raw_rects.append((rx1, ry1, rw, rh, comb_energy))
 
-        # OverTranslate DialogueTextGrouper ile çok satırlı bildirim paragraflarını tek kutuda birleştir
         grouped_rects = self._group_raw_rects(raw_rects, fw, fh)
 
         candidates: List[HUDCandidateBox] = []
         for rx1, ry1, rw, rh, comb_energy in grouped_rects:
             zkey = self._make_zone_key(rx1, ry1, rw, rh)
-            # 3. FİLTRE: Zaten aktif yaması varsa veya Dead-Zone kilidindeyse ASLA tekrar tarama!
             if not force_full_menu and (zkey in self.active_patches or zkey in self._dead_zones):
                 continue
 
@@ -415,41 +415,71 @@ class UniversalHUDRadar:
                 )
             )
 
-        # En belirgin kutuları önceliklendir
         candidates.sort(key=lambda c: c.comb_energy, reverse=True)
         return candidates[:max_candidates], patches_changed
 
     def lock_dead_zone(self, box: HUDCandidateBox) -> None:
-        """Bir kez bakılan kutuyu (içinde anlamlı yazı olmasa bile) kilitler; tekrar OCR çalışmaz."""
         self._dead_zones[box.zone_key] = box.comb_energy
 
-    def register_patch(self, box: HUDCandidateBox, source_text: str, translated_text: str) -> HUDTextPatch:
+    def register_patch(
+        self,
+        box: HUDCandidateBox,
+        source_text: str,
+        translated_text: str,
+        tight_bounds: Optional[Tuple[int, int, int, int]] = None,
+        num_lines: int = 1,
+    ) -> HUDTextPatch:
         """
-        Çevrilen HUD/menü kutusunu OverTranslate `RealtimeNaturalBackground` doğal doku yamasıyla
-        birlikte aktif yerinde (In-Place) yama olarak kaydeder.
+        Çevrilen HUD/menü kutusunu gerçek harf sınırlarına (`tight_bounds`) daraltarak ve
+        `32x12` parmak iziyle birlikte kaydeder.
         """
         self._dead_zones[box.zone_key] = box.comb_energy
-        natural_bg = RealtimeNaturalBackground.build_natural_patch(box.crop_rgb, box.bg_rgb)
+
+        px, py, pw, ph = box.x, box.y, box.w, box.h
+        patch_crop = box.crop_rgb
+        if tight_bounds is not None:
+            tx, ty, tw, th = tight_bounds
+            ch, cw = box.crop_rgb.shape[:2]
+            if 0 <= tx < cw and 0 <= ty < ch and tw >= 14 and th >= 10:
+                tx1 = max(0, tx - 3)
+                ty1 = max(0, ty - 2)
+                tx2 = min(cw, tx + tw + 3)
+                ty2 = min(ch, ty + th + 2)
+                px = box.x + tx1
+                py = box.y + ty1
+                pw = max(20, tx2 - tx1)
+                ph = max(12, ty2 - ty1)
+                patch_crop = box.crop_rgb[ty1:ty2, tx1:tx2].copy()
+
+        sampled_style = SourceTextColorSampler.sample(patch_crop)
+        natural_bg = RealtimeNaturalBackground.build_natural_patch(patch_crop, sampled_style.background_rgb)
+        fp = self._compute_fingerprint(patch_crop)
+
         patch = HUDTextPatch(
             zone_key=box.zone_key,
-            x=box.x,
-            y=box.y,
-            w=box.w,
-            h=box.h,
+            x=px,
+            y=py,
+            w=pw,
+            h=ph,
             source_text=source_text,
             translated_text=translated_text,
-            bg_rgb=box.bg_rgb,
-            text_rgb=box.text_rgb,
-            outline_rgb=box.outline_rgb,
+            bg_rgb=sampled_style.background_rgb,
+            text_rgb=sampled_style.text_rgb,
+            outline_rgb=sampled_style.outline_rgb or box.outline_rgb,
             comb_energy=box.comb_energy,
+            num_lines=max(1, int(num_lines)),
             natural_bg_patch=natural_bg,
+            fingerprint=fp,
         )
         self.active_patches[box.zone_key] = patch
         return patch
 
     @staticmethod
     def lookup_instant_glossary(text: str) -> Optional[str]:
-        """Menü ve HUD terimlerini 0.0 ms içinde çevirir."""
-        norm = re.sub(r"[^a-zA-Z0-9\s/]", "", (text or "")).strip().lower()
+        """Menü, HUD ve telefon terimlerini 0.0 ms içinde çevirir."""
+        raw = (text or "").strip().lower()
+        if raw in HUD_INSTANT_GLOSSARY:
+            return HUD_INSTANT_GLOSSARY[raw]
+        norm = re.sub(r"[^a-zA-Z0-9\s/]", "", raw).strip()
         norm = re.sub(r"\s+", " ", norm)
         return HUD_INSTANT_GLOSSARY.get(norm)

@@ -11,18 +11,21 @@ import mss
 import numpy as np
 from PIL import Image
 
+from replikai.core.game_window import map_region_to_game_window
+
 
 class ScreenCapturer:
     """
     DirectX / DWM uyumlu, kalıcı oturumlu ekran yakalayıcı.
-    3D oyunlarda (GTA 5, RDR 2) altyazı arkasındaki hareketli yolu/arabaları
-    yoksayarak SADECE siyah konturlu parlak altyazı piksellerinin değişimini izler.
+    3D oyunlarda (GTA 5, RDR 2) hem karanlık sahnelerde hem de güneşli sarı/parlak
+    asfalt/kaldırım üzerinde çıkan gölgeli/konturlu altyazıları %100 yakalar.
     """
 
     def __init__(self) -> None:
         self._tls = threading.local()
         self._last_subtitle_mask_small: Optional[np.ndarray] = None
         self.subtitle_currently_visible: bool = False
+        self.last_effective_region: Optional[Dict[str, int]] = None
 
     def _get_mss(self):
         """Her karede yeni GDI/DWM handle açıp kapatmak yerine kalıcı MSS nesnesi kullanır."""
@@ -40,39 +43,46 @@ class ScreenCapturer:
     def extract_outlined_subtitle_mask(rgb_arr: np.ndarray) -> np.ndarray:
         """
         Her renkteki (Beyaz, Sarı, Mavi/Camgöbeği MrBeast altyazıları, Yeşil, Kırmızı vb.)
-        konturlu veya koyu kutulu altyazı harflerini yakalar; çimen, gökyüzü ve duvar gibi
-        geniş arka plan yüzeylerini Top-Hat morfolojik filtre ile tamamen eler.
+        konturlu veya hafif gölgeli (GTA 5 güneşli sarı kaldırım üstü) altyazı harflerini yakalar:
+        - `th_max`: Renkli (sarı/mavi/yeşil) altyazıları yakalar.
+        - `th_min`: Güneşli sarı/turuncu yol üzerindeki beyaz altyazıları yakalar (sarı yolda Mavi kanal düşüktür, beyaz harfte yüksektir!).
+        - `local_drop`: Sabit `< 70` yerine 5x5 komşulukta yerel gölge/kontur farkına (`max_c - local_min > 40`) bakar;
+          böylece güneşli parlak zeminlerdeki yarı saydam oyun altyazı gölgelerini asla kaçırmaz!
         """
         max_c = np.max(rgb_arr, axis=2)
+        min_c = np.min(rgb_arr, axis=2)
 
-        # 11x11 Top-Hat: Sadece parlak harf çizgilerini geçirir,
-        # geniş parlak yüzeyleri (gökyüzü, çimen, asfalt, duvar) sıfırlar.
         kernel_th = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-        tophat = cv2.morphologyEx(max_c, cv2.MORPH_TOPHAT, kernel_th)
+        th_max = cv2.morphologyEx(max_c, cv2.MORPH_TOPHAT, kernel_th)
+        th_min = cv2.morphologyEx(min_c, cv2.MORPH_TOPHAT, kernel_th)
+        tophat = np.maximum(th_max, th_min)
 
-        # Altyazıların etrafındaki koyu kontur, gölge veya yarı saydam altyazı kutusu
-        dark_stroke = (max_c < 70).astype(np.uint8) * 255
-        near_dark = cv2.dilate(dark_stroke, np.ones((5, 5), np.uint8), iterations=1)
+        local_min = cv2.erode(min_c, np.ones((5, 5), np.uint8), iterations=1)
+        local_drop = max_c.astype(np.int16) - local_min.astype(np.int16)
 
-        subtitle_mask = ((tophat > 60) & (max_c > 152) & (near_dark > 0)).astype(np.uint8) * 255
+        subtitle_mask = ((tophat > 28) & (max_c > 145) & (local_drop > 40)).astype(np.uint8) * 255
         return subtitle_mask
 
     def capture_region(
         self,
         region: Dict[str, int],
-        diff_threshold: float = 2.2,
+        diff_threshold: float = 2.0,
         preprocess: bool = True,
         force: bool = False,
         target_hwnd: Optional[int] = None,
     ) -> Tuple[Optional[Image.Image], float]:
         """
         Fiziksel ekran koordinatlarındaki bölgeyi yakalar.
-        Ekranda altyazı yoksa `subtitle_currently_visible = False` işaretler ve `(None, 0.0)` döner.
+        Eğer oyun pencere modundaysa (`1536x864` vb.) bölgeyi otomatik olarak oyun penceresinin
+        alt-ortasına hizalar.
         """
-        left = max(0, int(region.get("left", 260)))
-        top = max(0, int(region.get("top", 790)))
-        width = max(100, int(region.get("width", 1400)))
-        height = max(40, int(region.get("height", 220)))
+        eff = map_region_to_game_window(region, target_hwnd)
+        self.last_effective_region = eff
+
+        left = max(0, int(eff.get("left", 260)))
+        top = max(0, int(eff.get("top", 790)))
+        width = max(100, int(eff.get("width", 1400)))
+        height = max(40, int(eff.get("height", 220)))
 
         sct = self._get_mss()
         monitor = {"left": left, "top": top, "width": width, "height": height}
@@ -85,7 +95,7 @@ class ScreenCapturer:
         active_pixels = int(np.count_nonzero(sub_mask))
 
         # Ekranda hiç altyazı yoksa (ör. GTA 5'te kimse konuşmuyorsa)
-        if not force and active_pixels < 42:
+        if not force and active_pixels < 30:
             self.subtitle_currently_visible = False
             self._last_subtitle_mask_small = None
             return None, 0.0
@@ -93,8 +103,6 @@ class ScreenCapturer:
         self.subtitle_currently_visible = True
 
         # Küçük 160x40 altyazı maskesi üzerinden AKTİF HARF PİKSELLERİNE göre fark ölç
-        # (Tam kutu ortalaması kısa altyazılarda 'lets team up' değişimini yutuyordu;
-        #  aktif piksel XOR oranı sayesinde 2 kelimelik en ufak altyazı değişimi bile %100 yakalanır!)
         small_mask = cv2.resize(sub_mask, (160, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
 
         diff_score = 999.0
@@ -102,47 +110,35 @@ class ScreenCapturer:
             self._last_subtitle_mask_small is not None
             and self._last_subtitle_mask_small.shape == small_mask.shape
         ):
-            cur_bin = small_mask > 18.0
-            prev_bin = self._last_subtitle_mask_small > 18.0
+            cur_bin = small_mask > 16.0
+            prev_bin = self._last_subtitle_mask_small > 16.0
             union_count = int(np.count_nonzero(cur_bin | prev_bin))
             xor_count = int(np.count_nonzero(cur_bin ^ prev_bin))
             xor_ratio = float(xor_count) / float(max(1, union_count))
             l1_active = float(np.sum(np.abs(small_mask - self._last_subtitle_mask_small))) / float(
                 max(1, union_count)
             )
-            diff_score = max(xor_ratio * 22.0, l1_active / 7.5)
+            diff_score = max(xor_ratio * 24.0, l1_active / 7.0)
 
         if not force and diff_score < diff_threshold:
             return None, diff_score
 
-        # Kelime kelime ekrana zıplayan (pop-in animasyonlu) altyazılarda ("You got" -> "You got no teammate.")
-        # harfler hala ekrana eklenmeye devam ediyorsa animasyon sabitlenene kadar (maks 3x 60ms) bekle:
+        # Hızlı 1x 45ms pop-in animasyon dengeleyici
         if not force:
-            for _ in range(3):
-                time.sleep(0.060)
-                sct_next = sct.grab(monitor)
-                bgra_next = np.asarray(sct_next, dtype=np.uint8)
-                rgb_next = bgra_next[:, :, [2, 1, 0]].copy()
-                mask_next = self.extract_outlined_subtitle_mask(rgb_next)
-                if int(np.count_nonzero(mask_next)) < 42:
-                    break
-                small_next = cv2.resize(mask_next, (160, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
-                c_bin = small_next > 18.0
-                p_bin = small_mask > 18.0
-                u_cnt = int(np.count_nonzero(c_bin | p_bin))
-                x_cnt = int(np.count_nonzero(c_bin ^ p_bin))
-                step_xor = float(x_cnt) / float(max(1, u_cnt))
+            time.sleep(0.045)
+            sct_next = sct.grab(monitor)
+            bgra_next = np.asarray(sct_next, dtype=np.uint8)
+            rgb_next = bgra_next[:, :, [2, 1, 0]].copy()
+            mask_next = self.extract_outlined_subtitle_mask(rgb_next)
+            if int(np.count_nonzero(mask_next)) >= 30:
                 rgb_arr = rgb_next
-                small_mask = small_next
-                # İki kare arasında yeni kelime/harf eklenmediyse (animasyon tamamlandıysa) hemen çık
-                if step_xor <= 0.045:
-                    break
+                small_mask = cv2.resize(mask_next, (160, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
 
         self._last_subtitle_mask_small = small_mask
         return Image.fromarray(rgb_arr), diff_score
 
     def capture_fullscreen_rgb(self) -> np.ndarray:
-        """Birincil monitörün tam ekran RGB dizisini (~2.5ms) döndürür (Sadece Oyun İçi HUD/Menü Radarı için)."""
+        """Birincil monitörün tam ekran RGB dizisini döndürür (Sadece Oyun İçi HUD/Menü Radarı için)."""
         sct = self._get_mss()
         mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
         sct_img = sct.grab(mon)

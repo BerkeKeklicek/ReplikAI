@@ -1,13 +1,4 @@
-"""Tam Ekran Yerinde (In-Place Spatial) Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviri Katmanı.
-
-OverTranslate Mimarisi Entegrasyonu:
-1. `RealtimeNaturalBackground` Doğal Doku Yaması:
-   Orijinal İngilizce yazının üstüne yapay/düz kutu çizmek yerine, `natural_bg_patch` ile
-   harfleri oyunun kendi arka plan dokusu/gradyanı içinde eriterek siler (`QImage` doku kaplama).
-2. `SourceTextColorSampler` & `OverlayTextColor`:
-   Oyunun kendi harf rengini (ör. GTA 5 sarı/kırmızı/mavi görev vurguları veya beyaz menü metni)
-   ve dış konturunu (`outline_rgb`) `QPainterPath` ile birebir koruyarak çizer.
-"""
+"""Tam Ekran Yerinde (In-Place Spatial) Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviri Katmanı."""
 
 from __future__ import annotations
 
@@ -30,10 +21,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from replikai.core.game_window import (
-    ensure_game_window_allows_overlay,
-    exclude_window_from_capture,
-)
+from replikai.core.game_window import exclude_window_from_capture
 from replikai.core.hud_radar import HUDTextPatch
 
 GWL_EXSTYLE = -20
@@ -46,13 +34,12 @@ HWND_TOPMOST = -1
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
-SWP_SHOWWINDOW = 0x0040
 
 
 class SpatialHUDOverlay(QWidget):
     """
     Oyun içindeki bildirim, ipucu, telefon ve ESC menüsü yazılarını
-    TAM OLARAK orijinal İngilizce kelimenin bulunduğu `(x, y, w, h)` koordinatının
+    TAM OLARAK orijinal İngilizce kelimenin bulunduğu sıkı `(x, y, w, h)` koordinatının
     üstüne (In-Place) doğal arka plan yaması (`RealtimeNaturalBackground`) ve
     orijinal oyun font rengiyle çizen şeffaf katman.
     """
@@ -74,9 +61,10 @@ class SpatialHUDOverlay(QWidget):
         self.show()
         self._apply_win32_passthrough_and_capture_exclusion()
 
+        # OverTranslate AlwaysOnTop.Reassert: Sadece kendi HWND'mizi 1000ms'de bir hafifçe en üste al (oyuna dokunma!)
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.ensure_topmost)
-        self._topmost_timer.start(300)
+        self._topmost_timer.start(1000)
 
     @staticmethod
     def get_dpr() -> float:
@@ -95,7 +83,6 @@ class SpatialHUDOverlay(QWidget):
         if sys.platform != "win32" or not self._patches:
             return
         try:
-            ensure_game_window_allows_overlay()
             hwnd = int(self.winId())
             ctypes.windll.user32.SetWindowPos(
                 wintypes.HWND(hwnd),
@@ -104,7 +91,7 @@ class SpatialHUDOverlay(QWidget):
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
         except Exception:
             pass
@@ -125,7 +112,7 @@ class SpatialHUDOverlay(QWidget):
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
         except Exception:
             pass
@@ -134,7 +121,7 @@ class SpatialHUDOverlay(QWidget):
         """Aktif yerinde (In-Place) Türkçe HUD/menü yamalarını günceller."""
         self._patches = list(patches)
         if self._patches:
-            self._apply_win32_passthrough_and_capture_exclusion()
+            self.ensure_topmost()
         self.update()
 
     def clear_patches(self) -> None:
@@ -181,13 +168,12 @@ class SpatialHUDOverlay(QWidget):
         for patch in self._patches:
             lx = float(patch.x) / dpr
             ly = float(patch.y) / dpr
-            lw = max(32.0, float(patch.w) / dpr)
-            lh = max(16.0, float(patch.h) / dpr)
+            lw = max(18.0, float(patch.w) / dpr)
+            lh = max(11.0, float(patch.h) / dpr)
 
             rect = QRectF(lx, ly, lw, lh)
 
-            # 1. OverTranslate `RealtimeNaturalBackground`:
-            # Düz kutu yerine orijinal harflerin etraftaki temiz piksellerle silindiği doğal doku yamasını çiz!
+            # 1. OverTranslate `RealtimeNaturalBackground` doğal arka plan doku yaması
             if patch.natural_bg_patch is not None and patch.natural_bg_patch.size > 0:
                 qimg = self._numpy_rgb_to_qimage(patch.natural_bg_patch)
                 painter.drawImage(rect, qimg)
@@ -195,24 +181,24 @@ class SpatialHUDOverlay(QWidget):
                 bg_col = QColor(patch.bg_rgb[0], patch.bg_rgb[1], patch.bg_rgb[2], 238)
                 painter.setBrush(bg_col)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawRoundedRect(rect, 4.0, 4.0)
+                painter.drawRoundedRect(rect, 3.0, 3.0)
 
-            # 2. Türkçe çeviriyi kutunun boyutuna (`lw x lh`) tam sığacak font boyutuyla hesapla
+            # 2. Satır başına yüksekliğe (`single_line_lh`) göre gerçek oyun font boyutunu hesapla
             text = patch.translated_text.strip()
             if not text:
                 continue
 
-            avail_w = max(24.0, lw - 8.0)
-            avail_h = max(12.0, lh - 4.0)
+            avail_w = max(16.0, lw - 4.0)
+            avail_h = max(10.0, lh - 2.0)
 
-            # Kutunun satır sayısına göre başlangıç font boyutunu belirle
-            font_px = max(10, min(20, int(lh * 0.52)))
+            single_line_lh = lh / float(max(1, patch.num_lines))
+            font_px = max(8, min(18, int(single_line_lh * 0.56)))
             font = QFont("Segoe UI", font_px, QFont.Weight.Bold)
             fm = QFontMetricsF(font)
             lines = self._wrap_text_lines(text, avail_w, fm)
 
-            while font_px > 9 and (
-                (len(lines) * fm.height() * 1.05 > avail_h)
+            while font_px > 8 and (
+                (len(lines) * fm.height() * 1.02 > avail_h)
                 or any(fm.horizontalAdvance(line) > avail_w for line in lines)
             ):
                 font_px -= 1
@@ -220,29 +206,26 @@ class SpatialHUDOverlay(QWidget):
                 fm = QFontMetricsF(font)
                 lines = self._wrap_text_lines(text, avail_w, fm)
 
-            line_h = fm.height() * 1.05
+            line_h = fm.height() * 1.02
             total_h = line_h * len(lines)
-            start_y = ly + max(fm.ascent() + 1.0, (lh - total_h) / 2.0 + fm.ascent())
+            start_y = ly + max(fm.ascent(), (lh - total_h) / 2.0 + fm.ascent())
 
             path = QPainterPath()
-            is_multi_line = len(lines) > 1
+            is_multi_line = len(lines) > 1 or patch.num_lines > 1
             for idx, line in enumerate(lines):
                 line_w = fm.horizontalAdvance(line)
                 if is_multi_line:
-                    # Çok satırlı bildirim kutularında (GTA 5 sol üst bilgi kutusu) sola hizalı
-                    tx = lx + 5.0
+                    tx = lx + 3.0
                 else:
-                    # Tek satırlı menü/buton etiketlerinde ortalı
-                    tx = lx + max(3.0, (lw - line_w) / 2.0)
+                    tx = lx + max(2.0, (lw - line_w) / 2.0)
                 ty = start_y + idx * line_h
                 path.addText(tx, ty, font, line)
 
-            # 3. OverTranslate `SourceTextColorSampler` + `OverlayTextColor`:
-            # Orijinal harf konturu (`outline_rgb`) + WCAG kontrast ayarlı orijinal harf rengi (`text_rgb`)
+            # 3. Orijinal harf konturu (`outline_rgb`) + WCAG kontrast ayarlı harf rengi (`text_rgb`)
             outline_col = QColor(patch.outline_rgb[0], patch.outline_rgb[1], patch.outline_rgb[2], 235)
             stroke_pen = QPen(
                 outline_col,
-                2.6,
+                2.2,
                 Qt.PenStyle.SolidLine,
                 Qt.PenCapStyle.RoundCap,
                 Qt.PenJoinStyle.RoundJoin,

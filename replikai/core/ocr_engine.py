@@ -1,4 +1,4 @@
-"""Yüksek Doğruluklu Oyun & Video Altyazı OCR Motoru (Hassas DBNet-Eşdeğeri Satır Kırpıcı + Warm ONNX + OverTranslate SpeakerLabel)."""
+"""Yüksek Doğruluklu Oyun & Video Altyazı OCR Motoru (2-Satır Vadi Ayırıcı + DBNet Fallback + OverTranslate SpeakerLabel)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 import threading
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -25,12 +25,14 @@ EN_MODEL_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "models
 
 class OCREngine:
     """
-    Oyun ve tam ekran video altyazılarını %99+ doğruluk ve ~45-90ms hızla okuyan motor:
-    1. Harflerin üst/alt sınırlarını DBNet gibi tam 1-2px toleransla (`y1-1 .. y2+2`) kırpar;
-       böylece CRNN 48px yüksekliğe ölçeklediğinde harfler ezilmez ve orta harfler yutulmaz.
-    2. Cümlenin başındaki ve sonundaki kelimeleri kesmez.
-    3. OverTranslate `SpeakerLabel` geometrisi ile üst satırdaki kısa konuşmacı adını
-       (`"Michael"`) diyalog satırından ayırıp `"Michael: ..."` formatına dönüştürür.
+    Oyun ve tam ekran video altyazılarını %99+ doğrulukla okuyan motor:
+    1. 2-Satır Vadi Ayırıcı (Valley Splitter): GTA 5 ve videolarda alt alta çıkan 2 satırlık
+       altyazıları (`"Mr. Weston checks...\nwait for a response."`) birbirine yapıştırmadan
+       yatay projeksiyon vadisinden iki ayrı satıra böler; böylece `use_det=False` CRNN
+       motoru 2 satırlık cümlelerde asla boş (`""`) dönmez!
+    2. Akıllı DBNet (`use_det=True`) Yedekleme: Arka plan çok karmaşıksa ve 1D satır okuma
+       düşük güven verirse, kırpılmış bölge üzerinde otomatik 2D DBNet satır tespiti çalıştırır.
+    3. OverTranslate `SpeakerLabel` geometrisi ile üst satırdaki kısa konuşmacı adını ayırır.
     """
 
     def __init__(self, min_confidence: float = 0.52) -> None:
@@ -84,32 +86,64 @@ class OCREngine:
                 self.backend_name = "Devre Dışı"
 
     @staticmethod
+    def _split_tall_band_at_valley(
+        row_counts: np.ndarray,
+        y1: int,
+        y2: int,
+    ) -> List[Tuple[int, int]]:
+        """
+        Eğer bir altyazı/HUD bandı 2 satır yüksekliğindeyse (`band_h >= 34`),
+        ortadaki `[%28..%72]` dikey aralıktaki en düşük piksel yoğunluklu satırı (vadiyi)
+        bularak bandı 2 ayrı satıra (`(y1, valley)` ve `(valley, y2)`) böler.
+        """
+        band_h = y2 - y1
+        if band_h < 34:
+            return [(y1, y2)]
+
+        s_off = max(8, int(band_h * 0.28))
+        e_off = min(band_h - 8, int(band_h * 0.72))
+        if e_off <= s_off + 2:
+            return [(y1, y2)]
+
+        sub_counts = row_counts[y1 + s_off : y1 + e_off]
+        valley_rel = int(np.argmin(sub_counts))
+        valley_val = float(sub_counts[valley_rel])
+        peak_top = float(np.max(row_counts[y1 : y1 + s_off + valley_rel + 1]))
+        peak_bot = float(np.max(row_counts[y1 + s_off + valley_rel : y2]))
+
+        # Vadi satırı üst ve alt satır zirvelerinden belirgin şekilde daha boşsa 2 satıra böl
+        if peak_top >= 8 and peak_bot >= 8 and valley_val <= min(peak_top, peak_bot) * 0.68:
+            vy = y1 + s_off + valley_rel
+            return [(y1, vy + 1), (max(y1, vy - 1), y2)]
+
+        return [(y1, y2)]
+
+    @classmethod
     def _slice_subtitle_lines_with_bounds(
+        cls,
         rgb_arr: np.ndarray,
     ) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
         """
-        Görüntüdeki altyazı satırlarını tespit eder ve CRNN'in maksimum doğrulukla (%99+)
-        okuyabilmesi için dikeyde harflere tam oturan (`y1-2 .. y2+3`) kırpımları ve
-        `(x, y, w, h)` koordinatlarını üretir.
+        Görüntüdeki altyazı satırlarını tespit eder; 2 satırlık birleşik bantları vadiden ikiye
+        ayırır ve her satır için `(crop, (x, y, w, h))` döndürür.
         """
         h, w, _ = rgb_arr.shape
         sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr).copy()
 
         # Sadece çok geniş (w > 950) ve yüksek (h > 140) yakalamalarda en alt 45px köşelerdeki
-        # YouTube video oynatıcı ikonlarını (play, süre, çark) maskeden temizle;
-        # orta satırlardaki GTA 5 / RDR 2 uzun altyazılarının solunu/sağını ASLA kesme!
+        # YouTube video oynatıcı ikonlarını maskeden temizle
         if w > 950 and h > 140:
             corner_x = int(w * 0.14)
             corner_y = h - 46
             sub_mask[corner_y:, :corner_x] = 0
             sub_mask[corner_y:, w - corner_x :] = 0
 
-        if np.count_nonzero(sub_mask) < 25:
+        if np.count_nonzero(sub_mask) < 20:
             max_c = np.max(rgb_arr, axis=2)
             sub_mask = ((max_c > 165).astype(np.uint8)) * 255
 
         row_counts = np.sum(sub_mask > 0, axis=1)
-        min_row_pixels = 5
+        min_row_pixels = 4
         active_rows = row_counts >= min_row_pixels
 
         raw_bands: List[Tuple[int, int]] = []
@@ -119,23 +153,22 @@ class OCREngine:
                 start_y = y
             elif not is_active and start_y is not None:
                 band_h = y - start_y
-                if 8 <= band_h <= 85:
-                    raw_bands.append((start_y, y))
+                if 7 <= band_h <= 110:
+                    raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, y))
                 start_y = None
-        if start_y is not None and 8 <= (h - start_y) <= 85:
-            raw_bands.append((start_y, h))
+        if start_y is not None and 7 <= (h - start_y) <= 110:
+            raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, h))
 
         merged_bands: List[Tuple[int, int]] = list(raw_bands)
 
-        # En yoğun 2 altyazı satırını yukarıdan aşağıya sırayla al (gereksiz ONNX çağrılarını önler)
-        if len(merged_bands) > 2:
+        # En yoğun 3 altyazı satırını yukarıdan aşağıya sırayla al
+        if len(merged_bands) > 3:
             merged_bands.sort(key=lambda b: int(np.sum(sub_mask[b[0] : b[1], :] > 0)), reverse=True)
-            merged_bands = sorted(merged_bands[:2], key=lambda b: b[0])
+            merged_bands = sorted(merged_bands[:3], key=lambda b: b[0])
 
         results: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
         for y1, y2 in merged_bands:
             band_mask = sub_mask[y1:y2, :]
-            # Satır içindeki kelimeleri 45px yatay kapatma ile bağla
             closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 45), np.uint8))
             col_active = np.sum(closed_line > 0, axis=0) >= 2
 
@@ -145,16 +178,15 @@ class OCREngine:
                 if val and sx is None:
                     sx = x
                 elif not val and sx is not None:
-                    if (x - sx) >= 12:
+                    if (x - sx) >= 10:
                         spans.append((sx, x))
                     sx = None
-            if sx is not None and (w - sx) >= 12:
+            if sx is not None and (w - sx) >= 10:
                 spans.append((sx, w))
 
-            # Aralarında <= 95px olan kelime bloklarını aynı cümlede tut (virgül/boşluk sonrası kelimeler kesilmesin)
             merged_spans: List[Tuple[int, int]] = []
             for sx1, sx2 in spans:
-                if merged_spans and (sx1 - merged_spans[-1][1]) <= 95:
+                if merged_spans and (sx1 - merged_spans[-1][1]) <= 110:
                     merged_spans[-1] = (merged_spans[-1][0], sx2)
                 else:
                     merged_spans.append((sx1, sx2))
@@ -164,20 +196,19 @@ class OCREngine:
 
             best_x1, best_x2 = max(merged_spans, key=lambda s: s[1] - s[0])
 
-            # Seçilen yatay aralıktaki gerçek harf piksellerinin tam üst/alt sınırını bul
             sub_patch = sub_mask[y1:y2, best_x1:best_x2]
             ys, xs = np.where(sub_patch > 0)
-            if len(ys) < 10:
+            if len(ys) < 8:
                 continue
 
             exact_y1 = max(0, y1 + int(ys.min()) - 2)
             exact_y2 = min(h, y1 + int(ys.max()) + 3)
-            exact_x1 = max(0, best_x1 + int(xs.min()) - 10)
-            exact_x2 = min(w, best_x1 + int(xs.max()) + 10)
+            exact_x1 = max(0, best_x1 + int(xs.min()) - 8)
+            exact_x2 = min(w, best_x1 + int(xs.max()) + 8)
 
             crop = rgb_arr[exact_y1:exact_y2, exact_x1:exact_x2]
             ch, cw = crop.shape[:2]
-            if cw >= 16 and ch >= 8:
+            if cw >= 14 and ch >= 8:
                 results.append((crop, (exact_x1, exact_y1, cw, ch)))
 
         return results
@@ -187,7 +218,7 @@ class OCREngine:
         return [crop for crop, _bounds in cls._slice_subtitle_lines_with_bounds(rgb_arr)]
 
     def extract_text(self, image: Image.Image) -> str:
-        """Görüntüdeki oyun veya video altyazısını yüksek doğrulukla okur."""
+        """Görüntüdeki oyun veya video altyazısını (1, 2 veya 3 satır) yüksek doğrulukla okur."""
         t0 = time.perf_counter()
         self._ensure_initialized()
         if not self._rapid_ocr:
@@ -206,13 +237,30 @@ class OCREngine:
                         if score >= self.min_confidence and text:
                             recognized.append((text, bounds))
 
+                # YEDEK (FALLBACK): Eğer 1D kesitlerden sonuç çıkmadıysa (ör. karmaşık güneşli zemin üzerinde
+                # birbirine çok yakın 2 satır), aktif alt bölge üzerinde 2D DBNet (`use_det=True`) çalıştır!
+                if not recognized and line_items:
+                    ax1 = min(b[0] for _, b in line_items)
+                    ay1 = min(b[1] for _, b in line_items)
+                    ax2 = max(b[0] + b[2] for _, b in line_items)
+                    ay2 = max(b[1] + b[3] for _, b in line_items)
+                    active_crop = rgb_arr[max(0, ay1 - 4) : min(rgb_arr.shape[0], ay2 + 4), max(0, ax1 - 6) : min(rgb_arr.shape[1], ax2 + 6)]
+                    if active_crop.size > 0:
+                        det_res, _ = self._rapid_ocr(active_crop, use_det=True, use_cls=False, use_rec=True)
+                        for item in det_res or []:
+                            box, txt, score = item[0], str(item[1]).strip(), float(item[2])
+                            if score >= self.min_confidence and txt:
+                                bx = int(min(p[0] for p in box))
+                                by = int(min(p[1] for p in box))
+                                bw = int(max(p[0] for p in box) - bx)
+                                bh = int(max(p[1] for p in box) - by)
+                                recognized.append((txt, (ax1 + bx, ay1 + by, bw, bh)))
+
             self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
             if not recognized:
                 return ""
 
-            # OverTranslate `SpeakerLabel` kontrolü:
-            # Eğer 2 satır okunduysa ve üstteki satır kısa bir konuşmacı adıysa ("Michael" / "Franklin"),
-            # cümleye yapıştırmak yerine "Michael: ..." olarak ayır!
+            # OverTranslate `SpeakerLabel` kontrolü
             if len(recognized) == 2:
                 top_txt, top_b = recognized[0]
                 bot_txt, bot_b = recognized[1]
@@ -224,40 +272,80 @@ class OCREngine:
             logger.error("OCR okuma hatası: %s", exc)
             return ""
 
-    def extract_hud_crop_text(self, crop_rgb: np.ndarray) -> str:
+    def extract_hud_crop_text_and_bounds(
+        self,
+        crop_rgb: np.ndarray,
+    ) -> Tuple[str, Optional[Tuple[int, int, int, int]], int]:
         """
-        UniversalHUDRadar tarafından kırpılan küçük veya çok satırlı HUD/Menü/Telefon
-        kutusunu (~15-35ms) okur.
+        UniversalHUDRadar tarafından kırpılan HUD/Menü/Telefon kutusunu okur ve
+        gerçek harflerin sıkı sınır kutusunu `(tight_x, tight_y, tight_w, tight_h)` + `satır_sayısı` döndürür.
+        Böylece:
+        - Telefondaki 'DIALING...' yazısının yanındaki kişi fotoğrafı (Devin) ASLA yama kutusuna dahil edilmez!
+        - 2 satırlık menü/diyalog özetlerinde (`Mr. Weston checks...\nresponse.`) her iki satır da eksiksiz okunur!
         """
         self._ensure_initialized()
         if not self._rapid_ocr or crop_rgb.size == 0:
-            return ""
+            return "", None, 1
 
         try:
             ch, cw = crop_rgb.shape[:2]
-            if ch > 44:
-                line_crops = self._slice_subtitle_lines(crop_rgb)
-                if not line_crops:
-                    line_crops = [crop_rgb]
-            else:
-                line_crops = [crop_rgb]
+            line_items = self._slice_subtitle_lines_with_bounds(crop_rgb) if ch >= 28 else []
 
             parts: List[str] = []
+            bounds_list: List[Tuple[int, int, int, int]] = []
+
             with self._lock:
-                for lc in line_crops[:4]:
-                    res, _ = self._rapid_ocr(lc, use_det=False, use_cls=False, use_rec=True)
-                    if res and len(res) > 0:
-                        txt, score = str(res[0][0]).strip(), float(res[0][1])
-                        if score >= 0.56 and txt:
-                            parts.append(txt)
+                if line_items:
+                    for lc, bnd in line_items[:4]:
+                        res, _ = self._rapid_ocr(lc, use_det=False, use_cls=False, use_rec=True)
+                        if res and len(res) > 0:
+                            txt, score = str(res[0][0]).strip(), float(res[0][1])
+                            if score >= 0.56 and txt:
+                                parts.append(txt)
+                                bounds_list.append(bnd)
+
+                # Tek satır veya 1D kesitten tam okunamadıysa doğrudan veya 2D DBNet ile oku
+                if not parts:
+                    if ch <= 34:
+                        res, _ = self._rapid_ocr(crop_rgb, use_det=False, use_cls=False, use_rec=True)
+                        if res and len(res) > 0:
+                            txt, score = str(res[0][0]).strip(), float(res[0][1])
+                            if score >= 0.58 and txt:
+                                parts.append(txt)
+                                bounds_list.append((2, 2, max(10, cw - 4), max(8, ch - 4)))
+                    if not parts:
+                        det_res, _ = self._rapid_ocr(crop_rgb, use_det=True, use_cls=False, use_rec=True)
+                        for item in det_res or []:
+                            box, txt, score = item[0], str(item[1]).strip(), float(item[2])
+                            if score >= 0.56 and txt:
+                                bx = max(0, int(min(p[0] for p in box)))
+                                by = max(0, int(min(p[1] for p in box)))
+                                bw = max(8, int(max(p[0] for p in box) - bx))
+                                bh = max(8, int(max(p[1] for p in box) - by))
+                                parts.append(txt)
+                                bounds_list.append((bx, by, bw, bh))
 
             raw = " ".join(parts).strip()
             if not raw:
-                return ""
+                return "", None, 1
             alpha_cnt = sum(1 for c in raw if c.isalpha())
             if alpha_cnt < 3:
-                return ""
-            return raw
+                return "", None, 1
+
+            if bounds_list:
+                tx1 = max(0, min(b[0] for b in bounds_list))
+                ty1 = max(0, min(b[1] for b in bounds_list))
+                tx2 = min(cw, max(b[0] + b[2] for b in bounds_list))
+                ty2 = min(ch, max(b[1] + b[3] for b in bounds_list))
+                tight_bounds: Optional[Tuple[int, int, int, int]] = (tx1, ty1, max(16, tx2 - tx1), max(10, ty2 - ty1))
+            else:
+                tight_bounds = (0, 0, cw, ch)
+
+            return raw, tight_bounds, max(1, len(parts))
         except Exception as exc:
             logger.debug("HUD OCR okuma hatası: %s", exc)
-            return ""
+            return "", None, 1
+
+    def extract_hud_crop_text(self, crop_rgb: np.ndarray) -> str:
+        txt, _bounds, _nlines = self.extract_hud_crop_text_and_bounds(crop_rgb)
+        return txt

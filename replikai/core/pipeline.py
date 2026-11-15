@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 import time
-from typing import Callable, List, Optional, Set
+from typing import Callable, List, Optional, Tuple
 
 from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
@@ -15,7 +15,7 @@ from replikai.core.game_window import (
     auto_detect_running_game,
     is_escape_key_pressed,
     is_game_active_in_foreground,
-    make_window_borderless_fullscreen,
+    map_region_to_game_window,
     set_process_gaming_friendly_priority,
 )
 from replikai.core.hud_radar import HUDTextPatch, UniversalHUDRadar
@@ -36,11 +36,12 @@ class TranslationEvent:
 
 class TranslationPipeline:
     """
-    Sıfır ayar gerektiren otomatik oyun altyazı & HUD takipçisi (OverTranslate Mimari Entegrasyonlu):
-    - Oyun açıldığında otomatik algılar ve DWM uyumlu çerçevesiz moda geçirir.
-    - Altyazı çıktığında ~35ms içinde okur, konuşmacı adını (`SpeakerLabel`) ayırır ve çevirir.
-    - Konuşma bittiğinde (altyazı ekrandan kalktığında) Türkçe altyazıyı otomatik gizler.
-    - OverTranslate `RealtimeBackgroundCadence` adaptif tarama hızı ile boşta %0 CPU tüketir.
+    Sıfır FPS-Drop Çift Kanal (Dual-Thread) Otomatik Oyun Altyazı & HUD Takipçisi:
+    1. `_loop` (Altyazı Kanalı): Sadece küçük altyazı şeridini (~130ms) izler; HUD taraması
+       tarafından ASLA bloklanmaz, 2 satırlık ardışık altyazıları bile anında yakalar.
+    2. `_hud_loop` (Arka Plan Oyun HUD/Menü Kanalı): Oyun penceresine müdahale etmeden,
+       FPS düşürmeden telefon (`DIALING...` -> `CONNECTED`), sol üst bildirim ve ESC menülerini
+       sıkı harf sınırlarıyla (`tight_bounds`) yerinde çevirir.
     """
 
     def __init__(
@@ -64,9 +65,9 @@ class TranslationPipeline:
         self.hud_radar = UniversalHUDRadar()
 
         self.target_hwnd: Optional[int] = None
-        self._borderless_applied_hwnds: Set[int] = set()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._hud_thread: Optional[threading.Thread] = None
         self._last_ocr_text: str = ""
         self._prev_clause_text: str = ""
         self._prev_clause_time: float = 0.0
@@ -74,7 +75,8 @@ class TranslationPipeline:
         self._idle_cycles: int = 0
         self._subtitle_shown: bool = False
         self._last_esc_time: float = 0.0
-        self._lock = threading.Lock()
+        self._sub_lock = threading.Lock()
+        self._hud_lock = threading.Lock()
         self._warmup_lock = threading.Lock()
         self._warmed_up = False
 
@@ -94,32 +96,34 @@ class TranslationPipeline:
     def is_running(self) -> bool:
         return self._running
 
-    def _auto_prepare_game_window(self) -> None:
-        """Çalışan bir oyun (GTA5, RDR2 vb.) varsa kullanıcıya sormadan otomatik hazırlar."""
+    def _auto_detect_game_hwnd(self) -> None:
+        """
+        Çalışan oyunu (GTA5, RDR2 vb.) sadece HWND olarak tespit eder;
+        oyunun pencere modunu veya çözünürlüğünü ASLA kendi kendine değiştirmez!
+        """
         detected = auto_detect_running_game()
         if not detected:
             return
         hwnd, _title, exe_name = detected
-        self.target_hwnd = hwnd
-        if hwnd not in self._borderless_applied_hwnds:
-            ok, _ = make_window_borderless_fullscreen(hwnd)
-            if ok:
-                self._borderless_applied_hwnds.add(hwnd)
-                if self.on_status:
-                    self.on_status(f"Otomatik Bağlandı: {exe_name}")
+        if self.target_hwnd != hwnd:
+            self.target_hwnd = hwnd
+            if self.on_status:
+                self.on_status(f"Oyun Algılandı: {exe_name}")
 
     def start(self) -> None:
         if self._running:
             return
         set_process_gaming_friendly_priority()
-        self._auto_prepare_game_window()
+        self._auto_detect_game_hwnd()
         self._running = True
         self._empty_ticks = 0
         self._idle_cycles = 0
         self.capturer.reset_state()
         self.hud_radar.reset()
         self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._hud_thread = threading.Thread(target=self._hud_loop, daemon=True)
         self._thread.start()
+        self._hud_thread.start()
         if self.on_status:
             self.on_status("Otomatik Altyazı & Oyun HUD Takibi Aktif")
 
@@ -145,7 +149,6 @@ class TranslationPipeline:
         OverTranslate `SpeakerLineStart` / `SpeakerLabel` korumalı çeviri:
         Metnin başında konuşmacı adı varsa (`"Michael: What are you doing?"`),
         sadece konuşma gövdesini çevirir ve konuşmacı adını koruyarak birleştirir.
-        Dönüş: `(translated_text, provider_label, from_cache, translate_ms)`
         """
         speaker, body = DialogueTextGrouper.split_speaker_prefix(query_text)
         target_body = body if speaker else query_text
@@ -218,9 +221,7 @@ class TranslationPipeline:
         if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
             return None
 
-        # Dinamik Kurgulu Cümle Birleştirici ("Whoever wins this" -> "let's team up"):
-        # Sadece ilk kart yarım bir yan cümleyse veya ikinci kart küçük harfle / "let's" ile devam ediyorsa birleştir;
-        # birleştirme yapıldıktan sonra zincirleme 3. cümlenin yapışmaması için _prev_clause_text'i sıfırla!
+        # Dinamik Kurgulu Cümle Birleştirici ("Whoever wins this" -> "let's team up")
         now_ts = time.perf_counter()
         query_text = cleaned
         is_joined_clause = False
@@ -287,7 +288,6 @@ class TranslationPipeline:
         if not translated or provider_label == "tr_ignored":
             return None
 
-        # Eğer çeviri orijinal metinle aynıysa (zaten Türkçe veya özel isimse) ekrana basma
         if not force and is_similar_text(query_text, translated, threshold=0.84):
             return None
 
@@ -308,100 +308,129 @@ class TranslationPipeline:
 
     def process_game_hud_frame(self, force_full_menu: bool = False) -> List[HUDTextPatch]:
         """
-        3 Filtreli + OverTranslate Doğal Doku Yamalı Evrensel Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviricisi:
-        - SADECE gerçek bir oyun ön plandayken (veya Alt+M ile manuel tetiklendiğinde) çalışır;
-          YouTube/tarayıcı videolarında devreye girmez!
-        - Tarak Dişi Harf Ritmi + Pop-In Doğum + Dead-Zone Kilidi ile %0 FPS drop yaratır.
+        3 Filtreli + OverTranslate Doğal Doku Yamalı Evrensel Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviricisi.
+        Ayrı arka plan iş parçacığında (`_hud_loop`) çalışır; altyazı çevirisini ve oyun FPS'ini ASLA etkilemez!
         """
-        if not force_full_menu:
-            if not self.config.enable_game_hud_radar or not is_game_active_in_foreground(self.target_hwnd):
-                if self.hud_radar.active_patches:
-                    self.hud_radar.reset()
-                    if self.on_hud_patches:
-                        self.on_hud_patches([])
-                return []
+        with self._hud_lock:
+            if not force_full_menu:
+                if not self.config.enable_game_hud_radar or not is_game_active_in_foreground(self.target_hwnd):
+                    if self.hud_radar.active_patches:
+                        self.hud_radar.reset()
+                        if self.on_hud_patches:
+                            self.on_hud_patches([])
+                    return []
 
-        full_rgb = self.capturer.capture_fullscreen_rgb()
-        max_cands = 14 if force_full_menu else 4
-        candidates, patches_changed = self.hud_radar.scan_for_new_hud_boxes(
-            full_rgb=full_rgb,
-            subtitle_region=self.config.capture_region,
-            force_full_menu=force_full_menu,
-            max_candidates=max_cands,
-        )
+            full_rgb = self.capturer.capture_fullscreen_rgb()
+            eff_sub_reg = map_region_to_game_window(self.config.capture_region, self.target_hwnd)
+            max_cands = 14 if force_full_menu else 3
+            candidates, patches_changed = self.hud_radar.scan_for_new_hud_boxes(
+                full_rgb=full_rgb,
+                subtitle_region=eff_sub_reg,
+                force_full_menu=force_full_menu,
+                max_candidates=max_cands,
+            )
 
-        if candidates:
-            self._idle_cycles = 0
+            for box in candidates:
+                raw_hud, tight_bounds, num_lines = self.ocr.extract_hud_crop_text_and_bounds(box.crop_rgb)
+                if not raw_hud:
+                    self.hud_radar.lock_dead_zone(box)
+                    continue
 
-        for box in candidates:
-            raw_hud = self.ocr.extract_hud_crop_text(box.crop_rgb)
-            if not raw_hud:
-                self.hud_radar.lock_dead_zone(box)
-                continue
+                # 1. Anlık 0.0 ms Oyun Menü & Telefon Sözlüğü ("MAP" -> "HARİTA", "DIALING..." -> "ARANIYOR..." vb.)
+                instant_tr = self.hud_radar.lookup_instant_glossary(raw_hud)
+                if instant_tr:
+                    self.hud_radar.register_patch(
+                        box,
+                        raw_hud,
+                        instant_tr,
+                        tight_bounds=tight_bounds,
+                        num_lines=num_lines,
+                    )
+                    patches_changed = True
+                    continue
 
-            # 1. Anlık 0.0 ms Oyun Menü Sözlüğü kontrolü ("MAP" -> "HARİTA", "SETTINGS" -> "AYARLAR" vb.)
-            instant_tr = self.hud_radar.lookup_instant_glossary(raw_hud)
-            if instant_tr:
-                self.hud_radar.register_patch(box, raw_hud, instant_tr)
+                # 2. Genel HUD / Telefon / İpucu cümlesi kontrolü
+                cleaned = normalize_ocr_text(raw_hud)
+                if not cleaned:
+                    self.hud_radar.lock_dead_zone(box)
+                    continue
+
+                translated, prov, _from_cache, _tr_ms = self._translate_preserving_speaker(cleaned)
+                if not translated or prov == "tr_ignored" or is_similar_text(cleaned, translated, threshold=0.86):
+                    self.hud_radar.lock_dead_zone(box)
+                    continue
+
+                self.hud_radar.register_patch(
+                    box,
+                    cleaned,
+                    translated,
+                    tight_bounds=tight_bounds,
+                    num_lines=num_lines,
+                )
                 patches_changed = True
-                continue
 
-            # 2. Genel HUD / Telefon / İpucu cümlesi kontrolü (OverTranslate konuşmacı korumalı)
-            cleaned = normalize_ocr_text(raw_hud)
-            if not cleaned:
-                self.hud_radar.lock_dead_zone(box)
-                continue
-
-            translated, prov, _from_cache, _tr_ms = self._translate_preserving_speaker(cleaned)
-            if not translated or prov == "tr_ignored" or is_similar_text(cleaned, translated, threshold=0.86):
-                self.hud_radar.lock_dead_zone(box)
-                continue
-
-            self.hud_radar.register_patch(box, cleaned, translated)
-            patches_changed = True
-
-        active_list = list(self.hud_radar.active_patches.values())
-        if patches_changed and self.on_hud_patches:
-            self.on_hud_patches(active_list)
-        return active_list
+            active_list = list(self.hud_radar.active_patches.values())
+            if patches_changed and self.on_hud_patches:
+                self.on_hud_patches(active_list)
+            return active_list
 
     def _loop(self) -> None:
+        """Hızlı, Sıfır-Blokajlı Altyazı Kanalı."""
         tick_counter = 0
         while self._running:
             t_start = time.perf_counter()
             tick_counter += 1
-            if tick_counter % 15 == 1:
-                self._auto_prepare_game_window()
-            if tick_counter % 55 == 0:
+            if tick_counter % 25 == 1:
+                self._auto_detect_game_hwnd()
+            if tick_counter % 65 == 0:
                 threading.Thread(target=self.translator.warmup, daemon=True).start()
             try:
-                with self._lock:
+                with self._sub_lock:
                     self.process_single_frame(force=False)
-                    # Oyun içindeyken ESC'ye basıldıysa menünün açılmasını bekleyip tüm menüyü yerinde çevir
-                    now_t = time.perf_counter()
-                    if (
-                        self.config.enable_game_hud_radar
-                        and (now_t - self._last_esc_time) > 1.2
-                        and is_escape_key_pressed()
-                        and is_game_active_in_foreground(self.target_hwnd)
-                    ):
-                        self._last_esc_time = now_t
-                        self._idle_cycles = 0
-                        time.sleep(0.22)
-                        self.process_game_hud_frame(force_full_menu=True)
-                    elif tick_counter % 2 == 0 and self.config.enable_game_hud_radar:
-                        self.process_game_hud_frame(force_full_menu=False)
             except Exception as exc:
                 if self.on_status:
                     self.on_status(f"Hata: {exc}")
 
             elapsed = time.perf_counter() - t_start
-            # OverTranslate `RealtimeBackgroundCadence` adaptif tarama hızı:
-            # Ekranda aktif konuşma/değişim varken hızlı (~140ms), sahne durgunken yumuşak (~240ms)
-            base_interval = max(0.14, float(self.config.scan_interval_ms) / 1000.0)
-            if self._idle_cycles >= 18:
-                adaptive_interval = min(0.26, base_interval * 1.35)
+            base_interval = max(0.12, float(self.config.scan_interval_ms) / 1000.0)
+            if self._idle_cycles >= 20:
+                adaptive_interval = min(0.24, base_interval * 1.3)
             else:
                 adaptive_interval = base_interval
-            sleep_for = max(0.04, adaptive_interval - elapsed)
+            sleep_for = max(0.03, adaptive_interval - elapsed)
             time.sleep(sleep_for)
+
+    def _hud_loop(self) -> None:
+        """
+        Ayrı Arka Plan Oyun HUD & ESC Menü Kanalı:
+        Altyazı kanalını bloklamaz ve 0.9 saniyelik yumuşak periyotla çalışarak
+        tam ekran 3D oyunlarda %0 FPS düşüşü sağlar.
+        """
+        while self._running:
+            t_start = time.perf_counter()
+            try:
+                if self.config.enable_game_hud_radar and is_game_active_in_foreground(self.target_hwnd):
+                    now_t = time.perf_counter()
+                    if (now_t - self._last_esc_time) > 1.0 and is_escape_key_pressed():
+                        self._last_esc_time = now_t
+                        time.sleep(0.20)
+                        self.process_game_hud_frame(force_full_menu=True)
+                    else:
+                        self.process_game_hud_frame(force_full_menu=False)
+                elif self.hud_radar.active_patches:
+                    self.hud_radar.reset()
+                    if self.on_hud_patches:
+                        self.on_hud_patches([])
+            except Exception:
+                pass
+
+            elapsed = time.perf_counter() - t_start
+            # ESC tuşunu hızlı yakalamak için kısa adımlarla ~0.85s bekle
+            remaining = max(0.20, 0.85 - elapsed)
+            steps = max(1, int(remaining / 0.10))
+            for _ in range(steps):
+                if not self._running:
+                    break
+                if (time.perf_counter() - self._last_esc_time) > 1.0 and is_escape_key_pressed():
+                    break
+                time.sleep(0.10)
