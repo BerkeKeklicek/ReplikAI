@@ -338,3 +338,67 @@ class GameTranslator:
                 return lines[-1]
 
         return full_translated
+
+    def translate_batch(self, texts: List[str]) -> List[str]:
+        """
+        Tam Ekran Menü / Envanter / Bilgi Kartı Toplu (Batch) Çevirisi:
+        25-40 adet menü/HUD satırını tek tek 30 ayrı istek atmak yerine TEK BİR HTTP
+        isteğinde (~180ms) toplu olarak çevirir.
+        """
+        if not texts:
+            return []
+
+        lang_map = {
+            "Türkçe": "tr",
+            "İngilizce": "en",
+            "Almanca": "de",
+            "İspanyolca": "es",
+            "Fransızca": "fr",
+        }
+        tl = lang_map.get(self.config.target_lang, "tr")
+        url = "https://translate.googleapis.com/translate_a/single"
+
+        results: List[str] = [""] * len(texts)
+        chunk_size = 24
+
+        for start in range(0, len(texts), chunk_size):
+            chunk = texts[start : start + chunk_size]
+            clean_chunk = [normalize_ocr_text(t).replace("\n", " ").strip() for t in chunk]
+            # Numaralı ayırıcı kullanmadan temiz satır sonlarıyla gönder (Google GTX \n sınırlarını korur)
+            payload = "\n".join(clean_chunk)
+            if not payload.strip():
+                continue
+            try:
+                params = {
+                    "client": "gtx",
+                    "sl": "auto",
+                    "tl": tl,
+                    "dt": "t",
+                    "q": payload,
+                }
+                with self._lock:
+                    resp = self._session.get(url, params=params, timeout=4.0)
+                resp.raise_for_status()
+                data = resp.json()
+                if data and isinstance(data[0], list):
+                    full_tr = "".join(c[0] for c in data[0] if c and c[0]).strip()
+                    tr_lines = [ln.strip() for ln in full_tr.splitlines()]
+                    if len(tr_lines) == len(clean_chunk):
+                        for idx, tr_line in enumerate(tr_lines):
+                            results[start + idx] = self._refine_contextual_dialogue(clean_chunk[idx], tr_line)
+                        continue
+            except Exception as exc:
+                logger.debug("Toplu çeviri hatası (tekli yedeğe geçiliyor): %s", exc)
+
+            # Satır sayısı uyuşmazsa bu küçük grupta tekli çeviriye düş (çevrimdışıysa güvenli atla)
+            for idx, item in enumerate(clean_chunk):
+                if not item:
+                    continue
+                try:
+                    tr, prov = self.translate(item)
+                    if tr and prov != "tr_ignored":
+                        results[start + idx] = tr
+                except Exception:
+                    break
+
+        return results

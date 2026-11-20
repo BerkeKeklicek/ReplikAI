@@ -74,10 +74,11 @@ GAME_PROFILES: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class CaptureRegion:
-    left: int = 260
-    top: int = 790
-    width: int = 1400
-    height: int = 220
+    # Evrensel alt-orta altyazı şeridi (x: %17..%83, y: %76..%95 — minimap ve köşe HUD hariç)
+    left: int = 330
+    top: int = 820
+    width: int = 1260
+    height: int = 210
 
     def to_dict(self) -> Dict[str, int]:
         return {

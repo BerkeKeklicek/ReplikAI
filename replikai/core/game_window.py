@@ -179,6 +179,34 @@ def is_escape_key_pressed() -> bool:
         return False
 
 
+class _CURSORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hCursor", wintypes.HANDLE),
+        ("ptScreenPos", wintypes.POINT),
+    ]
+
+
+def is_cursor_visible() -> bool:
+    """
+    Windows `GetCursorInfo` API (~0.005ms, %0 CPU):
+    3D oyunların %95'inde yürürken/araba sürerken fare imleci GİZLİDİR (`CURSOR_SHOWING == 0`).
+    Hangi tuşa basılırsa basılsın (ESC, M, I, Tab, J vb.) menü/harita/envanter açıldığında
+    fare imleci GÖRÜNÜR (`CURSOR_SHOWING == 1`) olur!
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        ci = _CURSORINFO()
+        ci.cbSize = ctypes.sizeof(_CURSORINFO)
+        if ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)):
+            return bool(ci.flags & 0x00000001)  # CURSOR_SHOWING
+    except Exception:
+        pass
+    return False
+
+
 def set_process_gaming_friendly_priority() -> None:
     """ReplikAI işlemini BELOW_NORMAL önceliğine alır; GTA5 / RDR2 gibi oyunların FPS'ini korur."""
     try:

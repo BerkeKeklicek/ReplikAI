@@ -475,6 +475,151 @@ class UniversalHUDRadar:
         return patch
 
     @staticmethod
+    def group_dbnet_blocks(
+        blocks: List[Tuple[str, Tuple[int, int, int, int]]],
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> List[Tuple[str, Tuple[int, int, int, int], int]]:
+        """
+        Gerçek 2D DBNet çıktısı `[(metin, (x, y, w, h)), ...]` üzerinde
+        OverTranslate `DialogueTextGrouper` kurallarını uygular:
+        - Aynı satırdaki bölünmüş kelimeleri birleştirir (menü sekmelerini ayrı tutar).
+        - Alt alta dizilmiş 2-4 satırlık bilgi kartı / diyalog paragraflarını TEK cümlede birleştirir!
+        Dönüş: `[(birlesik_metin, (abs_x, abs_y, w, h), satir_sayisi), ...]`
+        """
+        if not blocks:
+            return []
+
+        abs_blocks: List[Tuple[str, Tuple[int, int, int, int]]] = [
+            (txt.strip(), (bx + offset_x, by + offset_y, bw, bh))
+            for txt, (bx, by, bw, bh) in blocks
+            if txt and txt.strip()
+        ]
+        if not abs_blocks:
+            return []
+
+        # 1. Aynı yatay satırdaki komşu blokları birleştir
+        sorted_h = sorted(abs_blocks, key=lambda b: (b[1][1] // 14, b[1][0]))
+        row_merged: List[Tuple[str, Tuple[int, int, int, int]]] = []
+        for txt, rect in sorted_h:
+            rx, ry, rw, rh = rect
+            if row_merged:
+                ptxt, (px, py, pw, ph) = row_merged[-1]
+                if DialogueTextGrouper.adjacent_in_row((px, py, pw, ph), (rx, ry, rw, rh)):
+                    nx1 = min(px, rx)
+                    ny1 = min(py, ry)
+                    nx2 = max(px + pw, rx + rw)
+                    ny2 = max(py + ph, ry + rh)
+                    row_merged[-1] = (f"{ptxt} {txt}".strip(), (nx1, ny1, nx2 - nx1, ny2 - ny1))
+                    continue
+            row_merged.append((txt, rect))
+
+        # 2. Dikeyde aynı paragrafın devamı olan satırları birleştir
+        sorted_v = sorted(row_merged, key=lambda b: (b[1][1], b[1][0]))
+        groups: List[List[Tuple[str, Tuple[int, int, int, int]]]] = []
+        for item in sorted_v:
+            txt, rect = item
+            placed = False
+            for grp in groups:
+                if len(grp) >= 4:
+                    continue
+                _ptxt, prect = grp[-1]
+                if DialogueTextGrouper.next_paragraph_row(prect, rect):
+                    grp.append(item)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([item])
+
+        grouped_out: List[Tuple[str, Tuple[int, int, int, int], int]] = []
+        for grp in groups:
+            merged_text = " ".join(it[0] for it in grp).strip()
+            gx1 = min(it[1][0] for it in grp)
+            gy1 = min(it[1][1] for it in grp)
+            gx2 = max(it[1][0] + it[1][2] for it in grp)
+            gy2 = max(it[1][1] + it[1][3] for it in grp)
+            grouped_out.append((merged_text, (gx1, gy1, max(16, gx2 - gx1), max(12, gy2 - gy1)), len(grp)))
+
+        return grouped_out
+
+    @classmethod
+    def build_patch_from_rgb(
+        cls,
+        src_rgb: np.ndarray,
+        abs_rect: Tuple[int, int, int, int],
+        source_text: str,
+        translated_text: str,
+        num_lines: int = 1,
+        src_offset_x: int = 0,
+        src_offset_y: int = 0,
+    ) -> HUDTextPatch:
+        """
+        Gerçek 2D DBNet bloğundan OverTranslate doğal doku yaması (`RealtimeNaturalBackground`)
+        ve orijinal renk/kontur (`SourceTextColorSampler`) ile `HUDTextPatch` oluşturur.
+        """
+        sh, sw = src_rgb.shape[:2]
+        ax, ay, aw, ah = abs_rect
+        lx1 = max(0, (ax - src_offset_x) - 3)
+        ly1 = max(0, (ay - src_offset_y) - 2)
+        lx2 = min(sw, (ax - src_offset_x) + aw + 3)
+        ly2 = min(sh, (ay - src_offset_y) + ah + 2)
+
+        patch_crop = src_rgb[ly1:ly2, lx1:lx2].copy()
+        if patch_crop.size == 0:
+            patch_crop = np.full((max(12, ah), max(20, aw), 3), (18, 22, 30), dtype=np.uint8)
+
+        sampled_style = SourceTextColorSampler.sample(patch_crop)
+        natural_bg = RealtimeNaturalBackground.build_natural_patch(patch_crop, sampled_style.background_rgb)
+        fp = cls._compute_fingerprint(patch_crop)
+
+        px = src_offset_x + lx1
+        py = src_offset_y + ly1
+        pw = max(18, lx2 - lx1)
+        ph = max(12, ly2 - ly1)
+        zkey = f"db_{px // 12}_{py // 12}_{pw // 16}_{ph // 12}"
+
+        return HUDTextPatch(
+            zone_key=zkey,
+            x=px,
+            y=py,
+            w=pw,
+            h=ph,
+            source_text=source_text,
+            translated_text=translated_text,
+            bg_rgb=sampled_style.background_rgb,
+            text_rgb=sampled_style.text_rgb,
+            outline_rgb=sampled_style.outline_rgb or (10, 14, 20),
+            comb_energy=100,
+            num_lines=max(1, int(num_lines)),
+            natural_bg_patch=natural_bg,
+            fingerprint=fp,
+        )
+
+    @classmethod
+    def is_patch_still_matching(
+        cls,
+        patch: HUDTextPatch,
+        src_rgb: np.ndarray,
+        src_offset_x: int = 0,
+        src_offset_y: int = 0,
+        threshold: float = 16.0,
+    ) -> bool:
+        """Aktif yamanın altındaki oyun metni hala ekranda mı (`32x12` parmak izi ile) kontrol eder."""
+        if patch.fingerprint is None or src_rgb is None or src_rgb.size == 0:
+            return False
+        sh, sw = src_rgb.shape[:2]
+        lx1 = max(0, patch.x - src_offset_x)
+        ly1 = max(0, patch.y - src_offset_y)
+        lx2 = min(sw, lx1 + patch.w)
+        ly2 = min(sh, ly1 + patch.h)
+        if lx2 - lx1 < 8 or ly2 - ly1 < 6:
+            return False
+        cur_fp = cls._compute_fingerprint(src_rgb[ly1:ly2, lx1:lx2])
+        if cur_fp is None or cur_fp.shape != patch.fingerprint.shape:
+            return False
+        return float(np.mean(np.abs(cur_fp - patch.fingerprint))) <= threshold
+
+    @staticmethod
     def lookup_instant_glossary(text: str) -> Optional[str]:
         """Menü, HUD ve telefon terimlerini 0.0 ms içinde çevirir."""
         raw = (text or "").strip().lower()
