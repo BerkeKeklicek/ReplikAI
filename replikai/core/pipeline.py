@@ -14,6 +14,7 @@ from replikai.core.dialogue_grouper import DialogueTextGrouper
 from replikai.core.game_window import (
     auto_detect_running_game,
     is_escape_key_pressed,
+    is_exclusive_d3d_fullscreen_active,
     is_game_active_in_foreground,
     map_region_to_game_window,
     set_process_gaming_friendly_priority,
@@ -108,7 +109,12 @@ class TranslationPipeline:
         if self.target_hwnd != hwnd:
             self.target_hwnd = hwnd
             if self.on_status:
-                self.on_status(f"Oyun Algılandı: {exe_name}")
+                if is_exclusive_d3d_fullscreen_active():
+                    self.on_status(
+                        f"⚠️ {exe_name} Özel Tam Ekran (Fullscreen) modunda! Overlay için oyun ayarlarından 'Windowed Borderless' seçin."
+                    )
+                else:
+                    self.on_status(f"Oyun Algılandı: {exe_name}")
 
     def start(self) -> None:
         if self._running:

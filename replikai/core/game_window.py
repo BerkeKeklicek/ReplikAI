@@ -319,12 +319,53 @@ def make_window_borderless_fullscreen(hwnd: Optional[int] = None) -> Tuple[bool,
         return False, f"Pencere dönüştürme hatası: {exc}"
 
 
+def is_exclusive_d3d_fullscreen_active() -> bool:
+    """
+    Windows Shell API (`SHQueryUserNotificationState`) ile o an bir oyunun
+    DirectX Exclusive Fullscreen (`QUNS_RUNNING_D3D_FULL_SCREEN = 3`) modunda olup olmadığını tespit eder.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        state = ctypes.c_int(0)
+        hr = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+        return hr == 0 and state.value == 3
+    except Exception:
+        return False
+
+
 def ensure_game_window_allows_overlay(target_hwnd: Optional[int] = None) -> None:
     """
-    OverTranslate `AlwaysOnTop` prensibi:
-    Oyun penceresinin boyutuna, çözünürlüğüne veya `GWL_STYLE` bayraklarına ASLA dokunmaz!
-    (Oyun penceresine dışarıdan `SetWindowLongW` veya `SWP_FRAMECHANGED` göndermek GTA 5'i
-    kendi kendine 1536x864 pencere moduna düşürür ve DirectX swapchain takılmasına / FPS drop'a yol açar).
-    Bunun yerine sadece kendi overlay penceremizin `HWND_TOPMOST` bayrağı yenilenir.
+    Güvenli, Sıfır-Boyutlandırmalı Z-Order Düzeltici:
+    Eğer ön plandaki oyun (`GTA5.exe`, `RDR2.exe` vb.) kendi penceresine `WS_EX_TOPMOST` bayrağı
+    koyduysa, oyunun boyutuna/çözünürlüğüne veya `GWL_STYLE` bayraklarına ASLA dokunmadan
+    (`SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE`) sadece `HWND_NOTOPMOST` katmanına indirir.
+    Böylece oyun 1536x864'e küçülmez, FPS düşmez ve overlay oyunun üstünde kalır!
     """
-    return
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        fg_hwnd = int(user32.GetForegroundWindow())
+        if not fg_hwnd:
+            return
+        exe_name = get_window_process_name(fg_hwnd)
+        is_target_game = (exe_name in KNOWN_GAME_PROCESSES) or (target_hwnd and fg_hwnd == int(target_hwnd))
+        if not is_target_game or exe_name in NON_GAME_PROCESSES:
+            return
+
+        WS_EX_TOPMOST_FLAG = 0x00000008
+        HWND_NOTOPMOST = -2
+        ex_style = user32.GetWindowLongW(wintypes.HWND(fg_hwnd), GWL_EXSTYLE)
+        if ex_style & WS_EX_TOPMOST_FLAG:
+            user32.SetWindowPos(
+                wintypes.HWND(fg_hwnd),
+                wintypes.HWND(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+    except Exception:
+        pass

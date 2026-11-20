@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QVBoxLayout, QLabel, QWidget
 
 from replikai.config import AppConfig
 from replikai.core.game_window import (
+    ensure_game_window_allows_overlay,
     exclude_window_from_capture,
     map_region_to_game_window,
 )
@@ -31,11 +32,13 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
 
 HWND_TOPMOST = -1
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
 
 
@@ -162,13 +165,17 @@ class SubtitleOverlay(QWidget):
         self._drag_offset: Optional[QPoint] = None
         self._has_active_text: bool = False
 
-        # Tool bayrağını kullanmıyoruz ki tam ekran videoların (Chrome/Edge Fullscreen) üstüne çıkabilsin
+        # LunaTranslator / OverTranslate / Windows 11 Standardı:
+        # Qt.WindowType.Tool (WS_EX_TOOLWINDOW) olmadan Windows 11 DWM tam ekran/borderless
+        # oyun odaklandığında pencereyi oyunun arkasına atar!
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         # Konuşma bittiğinde altyazıyı otomatik temizleyen zamanlayıcı (7 saniye)
@@ -176,10 +183,10 @@ class SubtitleOverlay(QWidget):
         self._auto_hide_timer.setSingleShot(True)
         self._auto_hide_timer.timeout.connect(self.clear_subtitle)
 
-        # Tam ekran video veya oyun açıldığında Z-Order'da en üstte kalmayı garantileyen zamanlayıcı (1000ms, sıfır lag)
+        # OverTranslate AlwaysOnTop.Reassert: 500ms'de bir sadece kendi HWND'mizi en üst banda taşır
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.ensure_topmost)
-        self._topmost_timer.start(1000)
+        self._topmost_timer.start(500)
 
         self._build_layout()
         self.sync_geometry_from_config()
@@ -194,12 +201,13 @@ class SubtitleOverlay(QWidget):
         return float(screen.devicePixelRatio()) if screen else 1.0
 
     def ensure_topmost(self) -> None:
-        """OverTranslate AlwaysOnTop.Reassert: Sadece kendi HWND'mizi odak çalmadan en üste taşır."""
+        """OverTranslate / LunaTranslator AlwaysOnTop: Oyunu boyutlandırmadan kendi HWND'mizi en üste taşır."""
         if sys.platform != "win32":
             return
         try:
             if self.config.overlay_click_through:
                 self.sync_geometry_from_config()
+            ensure_game_window_allows_overlay()
             hwnd = int(self.winId())
             ctypes.windll.user32.SetWindowPos(
                 wintypes.HWND(hwnd),
@@ -334,13 +342,21 @@ class SubtitleOverlay(QWidget):
                 hwnd = int(self.winId())
                 exclude_window_from_capture(hwnd)
                 style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                base_style = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST
+                base_style = style | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
                 if enabled:
                     new_style = base_style | WS_EX_TRANSPARENT
                 else:
                     new_style = base_style & ~WS_EX_TRANSPARENT
                 ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
-                self.ensure_topmost()
+                ctypes.windll.user32.SetWindowPos(
+                    wintypes.HWND(hwnd),
+                    wintypes.HWND(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                )
             except Exception:
                 pass
         self.update()

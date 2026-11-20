@@ -21,7 +21,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from replikai.core.game_window import exclude_window_from_capture
+from replikai.core.game_window import (
+    ensure_game_window_allows_overlay,
+    exclude_window_from_capture,
+)
 from replikai.core.hud_radar import HUDTextPatch
 
 GWL_EXSTYLE = -20
@@ -29,11 +32,13 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
 
 HWND_TOPMOST = -1
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 
 
 class SpatialHUDOverlay(QWidget):
@@ -51,9 +56,11 @@ class SpatialHUDOverlay(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
@@ -61,10 +68,10 @@ class SpatialHUDOverlay(QWidget):
         self.show()
         self._apply_win32_passthrough_and_capture_exclusion()
 
-        # OverTranslate AlwaysOnTop.Reassert: Sadece kendi HWND'mizi 1000ms'de bir hafifçe en üste al (oyuna dokunma!)
+        # OverTranslate AlwaysOnTop.Reassert: 500ms'de bir sadece kendi HWND'mizi en üste al
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.ensure_topmost)
-        self._topmost_timer.start(1000)
+        self._topmost_timer.start(500)
 
     @staticmethod
     def get_dpr() -> float:
@@ -83,6 +90,7 @@ class SpatialHUDOverlay(QWidget):
         if sys.platform != "win32" or not self._patches:
             return
         try:
+            ensure_game_window_allows_overlay()
             hwnd = int(self.winId())
             ctypes.windll.user32.SetWindowPos(
                 wintypes.HWND(hwnd),
@@ -103,7 +111,7 @@ class SpatialHUDOverlay(QWidget):
             hwnd = int(self.winId())
             exclude_window_from_capture(hwnd)
             style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST
+            new_style = style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
             ctypes.windll.user32.SetWindowPos(
                 wintypes.HWND(hwnd),
@@ -112,7 +120,7 @@ class SpatialHUDOverlay(QWidget):
                 0,
                 0,
                 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
         except Exception:
             pass
