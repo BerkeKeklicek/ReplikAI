@@ -237,24 +237,15 @@ class OCREngine:
                         if score >= self.min_confidence and text:
                             recognized.append((text, bounds))
 
-                # YEDEK (FALLBACK): Eğer 1D kesitlerden sonuç çıkmadıysa (ör. karmaşık güneşli zemin üzerinde
-                # birbirine çok yakın 2 satır), aktif alt bölge üzerinde 2D DBNet (`use_det=True`) çalıştır!
-                if not recognized and line_items:
-                    ax1 = min(b[0] for _, b in line_items)
-                    ay1 = min(b[1] for _, b in line_items)
-                    ax2 = max(b[0] + b[2] for _, b in line_items)
-                    ay2 = max(b[1] + b[3] for _, b in line_items)
-                    active_crop = rgb_arr[max(0, ay1 - 4) : min(rgb_arr.shape[0], ay2 + 4), max(0, ax1 - 6) : min(rgb_arr.shape[1], ax2 + 6)]
-                    if active_crop.size > 0:
-                        det_res, _ = self._rapid_ocr(active_crop, use_det=True, use_cls=False, use_rec=True)
-                        for item in det_res or []:
-                            box, txt, score = item[0], str(item[1]).strip(), float(item[2])
-                            if score >= self.min_confidence and txt:
-                                bx = int(min(p[0] for p in box))
-                                by = int(min(p[1] for p in box))
-                                bw = int(max(p[0] for p in box) - bx)
-                                bh = int(max(p[1] for p in box) - by)
-                                recognized.append((txt, (ax1 + bx, ay1 + by, bw, bh)))
+            # YEDEK (GARANTİLİ 2D DBNET FALLBACK):
+            # 1D satır kesici 3D arka plan gürültüsü yüzünden boş döndüyse (`line_items == []` dahil!)
+            # doğrudan kırpılmış altyazı bandı üzerinde gerçek 2D DBNet (`detect_and_read_blocks`) çalıştır!
+            if not recognized:
+                db_blocks = self.detect_and_read_blocks(rgb_arr, min_conf=self.min_confidence, max_side=640)
+                if db_blocks:
+                    # Yukarıdan aşağıya, soldan sağa sırala
+                    db_blocks.sort(key=lambda item: (item[1][1] // 18, item[1][0]))
+                    recognized.extend(db_blocks)
 
             self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
             if not recognized:

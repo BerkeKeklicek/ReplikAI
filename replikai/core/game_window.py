@@ -169,12 +169,16 @@ def map_region_to_game_window(
 
 
 def is_escape_key_pressed() -> bool:
-    """Oyuncunun ESC tuşuna basıp menüyü açtığını ~0.01ms içinde kontrol eder."""
+    """
+    Oyuncunun ESC tuşuna basıp menüyü açtığını ~0.01ms içinde kontrol eder.
+    `0x8001` (hem şu an basılı `0x8000` hem de son kontrolden beri basıldı `0x0001` biti)
+    sayesinde kısa bir ESC dokunuşu uyku aralığında ASLA kaçmaz!
+    """
     if sys.platform != "win32":
         return False
     try:
         state = ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE)
-        return bool(state & 0x8000)
+        return bool(state & 0x8001)
     except Exception:
         return False
 

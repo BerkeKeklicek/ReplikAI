@@ -90,12 +90,12 @@ class TranslationPipeline:
         self._subtitle_shown: bool = False
 
         # Katman 2 (Köşe Bilgi Kartı) durumları
-        self._corner_prev_fp: Optional[np.ndarray] = None
-        self._corner_base_fp: Optional[np.ndarray] = None
+        self._corner_last_mask_fp: Optional[np.ndarray] = None
         self._corner_patches: List[HUDTextPatch] = []
 
         # Katman 3 (Otomatik Tam Ekran Menü / Harita / Envanter) durumları
         self._in_menu_mode: bool = False
+        self._esc_menu_toggle: bool = False
         self._menu_patches: List[HUDTextPatch] = []
         self._last_menu_fp: Optional[np.ndarray] = None
         self._pending_menu_fp: Optional[np.ndarray] = None
@@ -145,10 +145,10 @@ class TranslationPipeline:
         self._running = True
         self._empty_ticks = 0
         self._idle_cycles = 0
-        self._corner_prev_fp = None
-        self._corner_base_fp = None
+        self._corner_last_mask_fp = None
         self._corner_patches = []
         self._in_menu_mode = False
+        self._esc_menu_toggle = False
         self._menu_patches = []
         self._last_menu_fp = None
         self._pending_menu_fp = None
@@ -395,14 +395,13 @@ class TranslationPipeline:
         return event
 
     # =========================================================================
-    # KATMAN 2: CANLI KÖŞE BİLGİ KARTI RADARI (~0% FPS KAYBI, KÜÇÜK KIRPIM DBNET)
+    # KATMAN 2: CANLI KÖŞE BİLGİ KARTI RADARI (~0% FPS KAYBI, HAREKETLİ 3D'DE BİLE ÇALIŞIR)
     # =========================================================================
     def _scan_corner_info_cards(self) -> None:
         """
-        Oynanış sırasında (imleç gizliyken) ekranın SADECE sol-üst bilgi kartı köşesini
-        (`%0..%32 x %0..%28`, toplam ekranın %9'u) yakalar (~0.5ms).
-        Yeni bir bilgi/ipucu kartı belirip sabitlendiğinde o küçük kırpım üzerinde
-        gerçek 2D DBNet + Toplu Çeviri çalıştırır.
+        Oynanış sırasında ekranın SADECE sol-üst bilgi kartı köşesini (`%0..%32 x %0..%28`)
+        yakalar (~0.5ms). Ham 3D piksel farkı yerine harf-ritmi maskesi (`extract_outlined_subtitle_mask`)
+        kullandığı için yürürken veya araba sürerken 3D arka plan aksa bile bilgi kartını %100 yakalar!
         """
         game_rect = get_active_game_window_rect(self.target_hwnd)
         if game_rect:
@@ -411,48 +410,37 @@ class TranslationPipeline:
             sw, sh = self.capturer.get_primary_screen_size()
             gx, gy, gw, gh = 0, 0, sw, sh
 
-        # Sol-üst köşe bilgi/ipucu kartı şeridi (GTA 5, RDR 2, Witcher 3, Cyberpunk evrensel bildirim köşesi)
         cx = gx + int(gw * 0.01)
         cy = gy + int(gh * 0.02)
         cw = max(240, int(gw * 0.32))
         ch = max(120, int(gh * 0.28))
 
         corner_rgb = self.capturer.capture_rect_rgb(cx, cy, cw, ch)
-        cur_fp = cv2.resize(corner_rgb, (48, 24), interpolation=cv2.INTER_AREA).astype(np.float32)
+        corner_mask = ScreenCapturer.extract_outlined_subtitle_mask(corner_rgb)
+        active_px = int(np.count_nonzero(corner_mask))
 
-        # 1. Aktif köşe bilgi kartı ekrandan kaybolduysa yamayı anında sil
-        if self._corner_patches:
-            still_valid = [
-                p for p in self._corner_patches
-                if self.hud_radar.is_patch_still_matching(p, corner_rgb, src_offset_x=cx, src_offset_y=cy, threshold=16.0)
-            ]
-            if len(still_valid) != len(self._corner_patches):
-                self._corner_patches = still_valid
+        # Köşede hiç metin kalmadıysa aktif yamayı anında temizle
+        if active_px < 40:
+            self._corner_last_mask_fp = None
+            if self._corner_patches:
+                self._corner_patches = []
                 if self.on_hud_patches:
-                    self.on_hud_patches(list(self._corner_patches))
-
-        if self._corner_prev_fp is None or self._corner_base_fp is None:
-            self._corner_prev_fp = cur_fp
-            self._corner_base_fp = cur_fp
+                    self.on_hud_patches([])
             return
 
-        # 2. Sabitlik ve Yenilik Kontrolü:
-        # 3D dünya hareket ederken `diff_prev` yüksektir -> ASLA tetiklenmez!
-        # Yeni bir bilgi kartı belirip sabitlendiğinde `diff_prev <= 5.5` ve `diff_base >= 9.0` olur!
-        diff_prev = float(np.mean(np.abs(cur_fp - self._corner_prev_fp)))
-        diff_base = float(np.mean(np.abs(cur_fp - self._corner_base_fp)))
-        self._corner_prev_fp = cur_fp
+        small_mask = cv2.resize(corner_mask, (64, 32), interpolation=cv2.INTER_AREA) > 16
+        if self._corner_last_mask_fp is not None and self._corner_last_mask_fp.shape == small_mask.shape:
+            union = int(np.count_nonzero(small_mask | self._corner_last_mask_fp))
+            xor = int(np.count_nonzero(small_mask ^ self._corner_last_mask_fp))
+            xor_ratio = float(xor) / float(max(1, union))
+            # Aynı bilgi kartı ekranda duruyorsa tekrar OCR çalıştırma (%0 CPU!)
+            if xor_ratio < 0.16:
+                return
 
-        if diff_prev > 5.5 or diff_base < 9.0:
-            if diff_prev <= 5.5 and not self._corner_patches:
-                self._corner_base_fp = cur_fp
-            return
-
-        # Yeni sabitlenen köşe içeriği tespit edildi! Baseline'ı güncelle (aynı yeri tekrar tarama)
-        self._corner_base_fp = cur_fp
+        self._corner_last_mask_fp = small_mask
 
         # Küçük kırpım üzerinde (~55ms) gerçek 2D DBNet çalıştır!
-        raw_blocks = self.ocr.detect_and_read_blocks(corner_rgb, min_conf=0.58, max_side=640)
+        raw_blocks = self.ocr.detect_and_read_blocks(corner_rgb, min_conf=0.56, max_side=640)
         if not raw_blocks:
             return
 
@@ -581,13 +569,16 @@ class TranslationPipeline:
         - İmleç GİZLİ olduğunda (3D canlı oynanış) tüm menü yamalarını anında siler ve sadece
           Katman 2 (Hafif Sol-Üst Köşe Bilgi Kartı Radarı) çalışır (%0 FPS düşüşü!).
         """
+        esc_pending = False
         while self._running:
             t_start = time.perf_counter()
             try:
                 game_fg = self.config.enable_game_hud_radar and is_game_active_in_foreground(self.target_hwnd)
                 if not game_fg:
+                    esc_pending = False
                     if self._in_menu_mode or self._menu_patches or self._corner_patches:
                         self._in_menu_mode = False
+                        self._esc_menu_toggle = False
                         self._menu_patches = []
                         self._corner_patches = []
                         self._last_menu_fp = None
@@ -599,50 +590,52 @@ class TranslationPipeline:
 
                 cursor_now = is_cursor_visible()
                 now_t = time.perf_counter()
-                esc_hit = (now_t - self._last_esc_time) > 1.2 and is_escape_key_pressed()
+                esc_hit = esc_pending or ((now_t - self._last_esc_time) > 0.65 and is_escape_key_pressed())
+                esc_pending = False
                 if esc_hit:
                     self._last_esc_time = now_t
+                    # GTA 5 gibi kendi DirectX imlecini çizen oyunlarda ESC aç/kapa durumunu takip et
+                    self._esc_menu_toggle = not self._esc_menu_toggle
 
-                # KATMAN 3: İmleç görünürse (menü/harita/envanter açık!) veya ESC basıldıysa
-                if cursor_now or esc_hit:
+                should_be_menu = cursor_now or self._esc_menu_toggle
+
+                # KATMAN 3: İmleç görünürse (Witcher/Cyberpunk/BG3) VEYA ESC ile menü açıldıysa (GTA 5/RDR 2)
+                if should_be_menu:
                     if not self._in_menu_mode:
                         self._in_menu_mode = True
                         self._corner_patches = []
                         self._last_menu_fp = None
                         self._pending_menu_fp = None
-                        # Menü açılış/fade animasyonu bitsin diye kısa bekleme
-                        time.sleep(0.22)
+                        time.sleep(0.24)
                         self.process_game_hud_frame(force_full_menu=True)
                     else:
-                        # Kullanıcı menüde sekme değiştirdiyse (ör. MAP -> SETTINGS -> BRIEF) otomatik yenile!
                         self.process_game_hud_frame(force_full_menu=False)
                 else:
-                    # Oyuna geri dönüldü (imleç tekrar gizlendi!): Menü yamalarını ANINDA temizle!
                     if self._in_menu_mode:
                         self._in_menu_mode = False
                         self._menu_patches = []
                         self._last_menu_fp = None
                         self._pending_menu_fp = None
-                        self._corner_base_fp = None
-                        self._corner_prev_fp = None
+                        self._corner_last_mask_fp = None
                         if self.on_hud_patches:
                             self.on_hud_patches([])
 
-                    # KATMAN 2: Canlı oynanışta sadece hafif sol-üst bilgi kartı köşesini izle (~0.5ms)
+                    # KATMAN 2: Canlı oynanışta hafif sol-üst bilgi kartı köşesini izle (~0.5ms)
                     with self._hud_lock:
                         self._scan_corner_info_cards()
             except Exception:
                 pass
 
             elapsed = time.perf_counter() - t_start
-            # İmleç durumunu hızlı yakalamak için kısa uyku adımları
-            target_sleep = 0.45 if self._in_menu_mode else 0.75
-            remaining = max(0.12, target_sleep - elapsed)
-            steps = max(1, int(remaining / 0.08))
+            target_sleep = 0.45 if self._in_menu_mode else 0.65
+            remaining = max(0.10, target_sleep - elapsed)
+            steps = max(1, int(remaining / 0.06))
             for _ in range(steps):
                 if not self._running:
                     break
-                # Menüye giriş/çıkış anında (imleç değişimi) hiç beklemeden uyan!
+                if (time.perf_counter() - self._last_esc_time) > 0.65 and is_escape_key_pressed():
+                    esc_pending = True
+                    break
                 if is_cursor_visible() != self._in_menu_mode:
                     break
-                time.sleep(0.08)
+                time.sleep(0.06)

@@ -60,7 +60,18 @@ class ScreenCapturer:
         local_min = cv2.erode(min_c, np.ones((5, 5), np.uint8), iterations=1)
         local_drop = max_c.astype(np.int16) - local_min.astype(np.int16)
 
-        subtitle_mask = ((tophat > 28) & (max_c > 145) & (local_drop > 40)).astype(np.uint8) * 255
+        # Yatay harf ritmi (Comb filter): 3D yoldaki/çimendeki dağınık parlak gürültüyü eler,
+        # sadece yan yana harf kenarlarına sahip gerçek altyazı satırlarını geçirir!
+        dx = np.abs(np.diff(max_c.astype(np.int16), axis=1, append=0))
+        horiz_edges = (dx > 24).astype(np.uint8)
+        edge_density = cv2.boxFilter(horiz_edges, ddepth=-1, ksize=(11, 3), normalize=False)
+
+        subtitle_mask = (
+            (tophat > 30)
+            & (max_c > 148)
+            & (local_drop > 42)
+            & (edge_density >= 4)
+        ).astype(np.uint8) * 255
         return subtitle_mask
 
     def capture_region(
