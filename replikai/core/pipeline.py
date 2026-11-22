@@ -28,6 +28,8 @@ from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
 from replikai.core.capture import ScreenCapturer
 from replikai.core.dialogue_grouper import DialogueTextGrouper
+from replikai.core.frame_gate import FrameGate
+from replikai.core.game_packs import GamePackStore
 from replikai.core.game_window import (
     auto_detect_running_game,
     get_active_game_window_rect,
@@ -73,6 +75,8 @@ class TranslationPipeline:
         self.capturer = ScreenCapturer()
         self.ocr = OCREngine()
         self.cache = TranslationCache()
+        self.game_packs = GamePackStore()
+        self.frame_gate = FrameGate(stuck_after_ms=12_000)
         self.translator = GameTranslator(config)
         self.hud_radar = UniversalHUDRadar()
 
@@ -152,6 +156,7 @@ class TranslationPipeline:
         self._menu_patches = []
         self._last_menu_fp = None
         self._pending_menu_fp = None
+        self.frame_gate.reset()
         self.capturer.reset_state()
         self.hud_radar.reset()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -163,6 +168,7 @@ class TranslationPipeline:
 
     def stop(self) -> None:
         self._running = False
+        self.frame_gate.reset()
         self._corner_patches = []
         self._menu_patches = []
         self._in_menu_mode = False
@@ -184,6 +190,12 @@ class TranslationPipeline:
     def _translate_preserving_speaker(self, query_text: str) -> Tuple[str, str, bool, float]:
         speaker, body = DialogueTextGrouper.split_speaker_prefix(query_text)
         target_body = body if speaker else query_text
+
+        # 0. Nino GamePacks + PackFuzzy (0.0ms, 1-2 OCR harf hatasını otomatik onarır)
+        pack_hit = self.game_packs.lookup(target_body)
+        if pack_hit:
+            final_tr = f"{speaker}: {pack_hit}" if speaker else pack_hit
+            return final_tr, "Oyun Paketi ⚡", True, 0.0
 
         cached = self.cache.get(
             target_body,
@@ -235,8 +247,8 @@ class TranslationPipeline:
             if not cleaned:
                 continue
 
-            # 1. Anlık sözlük (0.0ms)
-            instant = self.hud_radar.lookup_instant_glossary(cleaned)
+            # 1. Anlık sözlük & Nino GamePacks / PackFuzzy (0.0ms)
+            instant = self.hud_radar.lookup_instant_glossary(cleaned) or self.game_packs.lookup(cleaned)
             if instant:
                 resolved[idx] = instant
                 continue
@@ -288,10 +300,20 @@ class TranslationPipeline:
         return out
 
     # =========================================================================
-    # KATMAN 1: CANLI ALTYAZI MOTORU (~120ms, %0 FPS KAYBI)
+    # KATMAN 1: CANLI ALTYAZI MOTORU (~120ms, %0 FPS KAYBI, NINO FRAMEGATE KORUMALI)
     # =========================================================================
     def process_single_frame(self, force: bool = True) -> Optional[TranslationEvent]:
-        """Tek bir altyazı şeridi karesini yakalar, okur ve çevirir."""
+        """Tek bir altyazı şeridi karesini FrameGate korumasıyla yakalar, okur ve çevirir."""
+        status, token = self.frame_gate.enter()
+        if status == "busy" and not force:
+            return None
+        try:
+            return self._process_single_frame_inner(force=force, token=token)
+        finally:
+            if token:
+                self.frame_gate.leave(token)
+
+    def _process_single_frame_inner(self, force: bool, token: int) -> Optional[TranslationEvent]:
         t0 = time.perf_counter()
         img, _ = self.capturer.capture_region(
             region=self.config.capture_region,
@@ -379,6 +401,10 @@ class TranslationPipeline:
         if not force and is_similar_text(query_text, translated, threshold=0.84):
             return None
 
+        # FrameGate kontrolü: Çeviri sürerken uygulama durdurulduysa veya yeni tur başladıysa eski sonucu basma
+        if token and not self.frame_gate.is_current(token):
+            return None
+
         self._subtitle_shown = True
         latency = (time.perf_counter() - t0) * 1000.0
         event = TranslationEvent(
@@ -445,7 +471,21 @@ class TranslationPipeline:
             return
 
         grouped = self.hud_radar.group_dbnet_blocks(raw_blocks, offset_x=cx, offset_y=cy)
-        translated_items = self._batch_translate_grouped_blocks(grouped)
+        # Nino CornerBlock.tipBox filtresi: 1-2 kelimelik gürültüyü ve dikey harita etiketlerini ele!
+        filtered_grouped = [
+            item
+            for item in grouped
+            if DialogueTextGrouper.is_valid_corner_tip_block(
+                item[0],
+                item[1],
+                num_lines=item[2],
+                is_known_glossary=bool(self.hud_radar.lookup_instant_glossary(item[0])),
+            )
+        ]
+        if not filtered_grouped:
+            return
+
+        translated_items = self._batch_translate_grouped_blocks(filtered_grouped)
         if not translated_items:
             return
 

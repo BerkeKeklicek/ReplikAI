@@ -178,3 +178,40 @@ class DialogueTextGrouper:
 
         # Sola yaslı paragraf (GTA 5 bildirim kutusu) veya ortalanmış diyalog
         return left_delta <= 0.65 or center_delta <= 0.55
+
+    @staticmethod
+    def is_valid_corner_tip_block(
+        text: str,
+        rect: Tuple[int, int, int, int],
+        num_lines: int = 1,
+        is_known_glossary: bool = False,
+    ) -> bool:
+        """
+        Nino (`CornerBlock.swift`) Akıllı Köşe Bilgi Kartı Filtresi:
+        Sol-üst köşedeki gerçek ipucu/bildirim kutularını (`"Press E to..."`, `"Discount Store is closed..."`)
+        harita yer adları ve 3D gürültüden (`"CA"`, `"NH"`, tek kelimelik sapmalar) ayırır:
+        - Tek satırsa yatay şekilli olmalı (`w > h * 1.15`).
+        - Bilinen sözlük terimi değilse en az 3 gerçek kelime içermeli VEYA görev işaretiyle (`◆`, `•`, `[`) başlamalı!
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        if is_known_glossary:
+            return True
+
+        _x, _y, w, h = rect
+        if num_lines == 1 and w <= max(1, h) * 1.15:
+            return False
+
+        # Gerçek kelimeleri say (en az 2 harfli kelimeler)
+        words = [tok for tok in re.split(r"[^A-Za-z']+", cleaned) if len(tok) >= 2]
+        if len(words) >= 3:
+            return True
+
+        # Görev işaretiyle ("◆ Escape the mine", "[E] Interact") başlayan kısa satırları da geçir
+        first_ch = cleaned[0]
+        starts_with_marker = (not first_ch.isalnum()) and (first_ch not in ("'", '"', "-", "."))
+        if starts_with_marker and len(words) >= 2:
+            return True
+
+        return False

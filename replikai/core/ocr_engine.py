@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import re
 import threading
 import time
 from typing import List, Optional, Tuple
@@ -18,6 +19,28 @@ from replikai.core.capture import ScreenCapturer
 from replikai.core.dialogue_grouper import DialogueTextGrouper
 
 logger = logging.getLogger(__name__)
+
+# Nino (`WindowsSpellCheck.Score`) hafif yerel İngilizce kelime puanlayıcı sözlüğü
+COMMON_ENGLISH_WORDS = frozenset(
+    {
+        "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it", "for", "not", "on", "with",
+        "he", "as", "you", "do", "at", "this", "but", "his", "by", "from", "they", "we", "say", "her",
+        "she", "or", "an", "will", "my", "one", "all", "would", "there", "their", "what", "so", "up",
+        "out", "if", "about", "who", "get", "which", "go", "me", "when", "make", "can", "like", "time",
+        "no", "just", "him", "know", "take", "people", "into", "year", "your", "good", "some", "could",
+        "them", "see", "other", "than", "then", "now", "look", "only", "come", "its", "over", "think",
+        "also", "back", "after", "use", "two", "how", "our", "work", "first", "well", "way", "even",
+        "new", "want", "because", "any", "these", "give", "day", "most", "us", "is", "are", "was", "were",
+        "been", "has", "had", "did", "does", "doing", "got", "going", "need", "let", "lets", "hey",
+        "here", "where", "why", "wait", "stop", "right", "left", "down", "back", "man", "men", "guy",
+        "guys", "car", "kill", "dead", "money", "shit", "fuck", "hell", "damn", "please", "sorry",
+        "thanks", "thank", "yes", "yeah", "nope", "okay", "ok", "sure", "really", "never", "always",
+        "still", "keep", "hold", "leave", "call", "tell", "told", "said", "talk", "listen", "watch",
+        "find", "found", "take", "took", "give", "gave", "come", "came", "went", "gone", "done",
+        "through", "personal", "line", "service", "twice", "details", "response", "mission", "police",
+        "cops", "area", "vehicle", "press", "open", "close", "door", "help", "run", "shoot", "drive",
+    }
+)
 
 EN_MODEL_URL = "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx"
 EN_MODEL_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "models" / "en_PP-OCRv3_rec_infer.onnx"
@@ -217,8 +240,95 @@ class OCREngine:
     def _slice_subtitle_lines(cls, rgb_arr: np.ndarray) -> List[np.ndarray]:
         return [crop for crop, _bounds in cls._slice_subtitle_lines_with_bounds(rgb_arr)]
 
+    @staticmethod
+    def _make_white_isolated_view(rgb_arr: np.ndarray) -> np.ndarray:
+        """
+        Nino (`WindowsOcrReader.cs` beyaz yazı yalıtımı):
+        GTA 5 / RDR 2 gibi oyunlarda güneşli sarı kaldırım, ten veya açık gömlek üzerindeki
+        beyaz altyazıları ayırmak için düşük doygunluklu parlak harfleri beyaz tuval üstünde
+        keskin siyah harfe dönüştürür.
+        """
+        max_c = np.max(rgb_arr, axis=2)
+        min_c = np.min(rgb_arr, axis=2)
+        sat = max_c.astype(np.int16) - min_c.astype(np.int16)
+        local_min = cv2.erode(min_c, np.ones((5, 5), np.uint8), iterations=1)
+        local_drop = max_c.astype(np.int16) - local_min.astype(np.int16)
+
+        white_mask = ((min_c > 172) & (sat < 52) & (local_drop > 32)).astype(np.uint8) * 255
+        # Harf gövdelerini 1px temizle ve siyah-yazı / beyaz-zemin (OCR ideal formatı) yap
+        inv = 255 - white_mask
+        return cv2.cvtColor(inv, cv2.COLOR_GRAY2RGB)
+
+    @staticmethod
+    def _make_auto_level_view(rgb_arr: np.ndarray) -> np.ndarray:
+        """
+        Nino (`UseAutoLevel`): En parlak %0.5'i 255'e, en koyu %5'i 0'a gererek
+        düşük kontrastlı sahnelerdeki altyazıyı keskinleştirir.
+        """
+        arr = rgb_arr.astype(np.float32)
+        lo = float(np.percentile(arr, 5.0))
+        hi = float(np.percentile(arr, 99.5))
+        if hi - lo < 25.0:
+            return rgb_arr
+        stretched = np.clip((arr - lo) * (255.0 / (hi - lo)), 0.0, 255.0).astype(np.uint8)
+        return stretched
+
+    @staticmethod
+    def _score_english_readability(text: str, avg_conf: float) -> float:
+        """
+        Nino (`WindowsSpellCheck.Score` benzeri) okunabilirlik puanlayıcı:
+        OCR çıktısındaki gerçek İngilizce kelime oranını, temiz harf yapısını ve güven puanını
+        birleştirerek birden fazla ön-işleme adayı arasından en doğru cümleyi seçer.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return 0.0
+        tokens = [t.lower() for t in re.findall(r"[A-Za-z']+", cleaned) if len(t) >= 2]
+        if not tokens:
+            return 0.0
+
+        known_hits = sum(1 for t in tokens if t in COMMON_ENGLISH_WORDS or t.rstrip("'s") in COMMON_ENGLISH_WORDS)
+        vowel_ok = sum(1 for t in tokens if any(v in t for v in "aeiouy"))
+        known_ratio = float(known_hits) / float(len(tokens))
+        vowel_ratio = float(vowel_ok) / float(len(tokens))
+
+        # Bozuk/gürültülü sembol oranı cezası
+        alpha_space = sum(1 for c in cleaned if c.isalpha() or c.isspace() or c in ".,!?'-:")
+        clean_ratio = float(alpha_space) / float(max(1, len(cleaned)))
+
+        length_bonus = min(1.0, len(tokens) / 5.0) * 0.15
+        return (avg_conf * 0.45) + (known_ratio * 0.30) + (vowel_ratio * 0.15) + (clean_ratio * 0.10) + length_bonus
+
+    def _run_fast_1d_ocr(self, rgb_arr: np.ndarray) -> Tuple[str, float]:
+        """Sadece hızlı 1D satır kesici + CRNN (~30-45ms) çalıştırır (çoklu aday testleri için)."""
+        line_items = self._slice_subtitle_lines_with_bounds(rgb_arr)
+        recognized: List[Tuple[str, Tuple[int, int, int, int], float]] = []
+        with self._lock:
+            for crop, bounds in line_items:
+                res, _ = self._rapid_ocr(crop, use_det=False, use_cls=False, use_rec=True)
+                if res and len(res) > 0:
+                    text, score = str(res[0][0]).strip(), float(res[0][1])
+                    if score >= self.min_confidence and text:
+                        recognized.append((text, bounds, score))
+        if not recognized:
+            return "", 0.0
+        avg_conf = sum(r[2] for r in recognized) / float(len(recognized))
+        if len(recognized) == 2:
+            top_txt, top_b, _ = recognized[0]
+            bot_txt, bot_b, _ = recognized[1]
+            if DialogueTextGrouper.is_speaker_label_line(top_txt, top_b, bot_b):
+                return normalize_ocr_text(f"{top_txt}: {bot_txt}"), avg_conf
+        return normalize_ocr_text(" ".join(r[0] for r in recognized)), avg_conf
+
     def extract_text(self, image: Image.Image) -> str:
-        """Görüntüdeki oyun veya video altyazısını (1, 2 veya 3 satır) yüksek doğrulukla okur."""
+        """
+        Nino Çoklu Ön-İşleme + İngilizce Sözlük Puanlamalı Hızlı Altyazı Okuyucu:
+        1. Önce ham karede hızlı 1D CRNN (~35ms) dener. Okunabilirlik yüksekse anında döner.
+        2. Güneşli kaldırım / açık zemin yüzünden ham okuma zayıfsa `white_isolated` (beyaz harf yalıtımı)
+           ve `auto_level` (kontrast germe) üzerinde hızlı 1D CRNN (~35ms) dener ve en yüksek
+           İngilizce okunabilirlik puanlı adayı seçer.
+        3. Hala sonuç çıkmadıysa tek seferlik garantili 2D DBNet (`detect_and_read_blocks`) çalıştırır.
+        """
         t0 = time.perf_counter()
         self._ensure_initialized()
         if not self._rapid_ocr:
@@ -226,39 +336,49 @@ class OCREngine:
 
         try:
             rgb_arr = np.asarray(image.convert("RGB"))
-            line_items = self._slice_subtitle_lines_with_bounds(rgb_arr)
 
-            recognized: List[Tuple[str, Tuple[int, int, int, int]]] = []
-            with self._lock:
-                for crop, bounds in line_items:
-                    res, _ = self._rapid_ocr(crop, use_det=False, use_cls=False, use_rec=True)
-                    if res and len(res) > 0:
-                        text, score = str(res[0][0]).strip(), float(res[0][1])
-                        if score >= self.min_confidence and text:
-                            recognized.append((text, bounds))
+            # Aday 1: Ham görüntü (hızlı 1D CRNN ~35ms)
+            best_text, best_conf = self._run_fast_1d_ocr(rgb_arr)
+            best_score = self._score_english_readability(best_text, best_conf)
 
-            # YEDEK (GARANTİLİ 2D DBNET FALLBACK):
-            # 1D satır kesici 3D arka plan gürültüsü yüzünden boş döndüyse (`line_items == []` dahil!)
-            # doğrudan kırpılmış altyazı bandı üzerinde gerçek 2D DBNet (`detect_and_read_blocks`) çalıştır!
-            if not recognized:
+            # Akıllı kısa devre: Ham okuma zaten çok temizse ek ön-işleme yapma (0ms ek yük!)
+            if best_text and best_conf >= 0.85 and best_score >= 0.72 and len(best_text) >= 6:
+                self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
+                return best_text
+
+            # Aday 2: Nino Beyaz Harf Yalıtımı (hızlı 1D CRNN ~35ms)
+            white_view = self._make_white_isolated_view(rgb_arr)
+            if int(np.count_nonzero(white_view[:, :, 0] < 128)) >= 30:
+                w_text, w_conf = self._run_fast_1d_ocr(white_view)
+                w_score = self._score_english_readability(w_text, w_conf)
+                if w_score > best_score:
+                    best_text, best_score = w_text, w_score
+
+            # Aday 3: Nino Otomatik Kontrast Germe (sadece hala zayıfsa, hızlı 1D CRNN ~35ms)
+            if best_score < 0.62:
+                auto_view = self._make_auto_level_view(rgb_arr)
+                a_text, a_conf = self._run_fast_1d_ocr(auto_view)
+                a_score = self._score_english_readability(a_text, a_conf)
+                if a_score > best_score:
+                    best_text, best_score = a_text, a_score
+
+            # Garantili Tek Seferlik 2D DBNet Yedeği (1D adaylarının hiçbiri tatmin etmediyse)
+            if best_score < 0.55:
                 db_blocks = self.detect_and_read_blocks(rgb_arr, min_conf=self.min_confidence, max_side=640)
                 if db_blocks:
-                    # Yukarıdan aşağıya, soldan sağa sırala
                     db_blocks.sort(key=lambda item: (item[1][1] // 18, item[1][0]))
-                    recognized.extend(db_blocks)
+                    if len(db_blocks) == 2 and DialogueTextGrouper.is_speaker_label_line(
+                        db_blocks[0][0], db_blocks[0][1], db_blocks[1][1]
+                    ):
+                        db_text = normalize_ocr_text(f"{db_blocks[0][0]}: {db_blocks[1][0]}")
+                    else:
+                        db_text = normalize_ocr_text(" ".join(b[0] for b in db_blocks))
+                    db_score = self._score_english_readability(db_text, 0.80)
+                    if db_score > best_score:
+                        best_text = db_text
 
             self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
-            if not recognized:
-                return ""
-
-            # OverTranslate `SpeakerLabel` kontrolü
-            if len(recognized) == 2:
-                top_txt, top_b = recognized[0]
-                bot_txt, bot_b = recognized[1]
-                if DialogueTextGrouper.is_speaker_label_line(top_txt, top_b, bot_b):
-                    return normalize_ocr_text(f"{top_txt}: {bot_txt}")
-
-            return normalize_ocr_text(" ".join(txt for txt, _ in recognized))
+            return best_text
         except Exception as exc:
             logger.error("OCR okuma hatası: %s", exc)
             return ""
