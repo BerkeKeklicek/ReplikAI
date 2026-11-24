@@ -337,33 +337,33 @@ class OCREngine:
         try:
             rgb_arr = np.asarray(image.convert("RGB"))
 
-            # Aday 1: Ham görüntü (hızlı 1D CRNN ~35ms)
+            # Aday 1: Ham görüntü (hızlı 1D CRNN ~30-35ms)
             best_text, best_conf = self._run_fast_1d_ocr(rgb_arr)
             best_score = self._score_english_readability(best_text, best_conf)
 
-            # Akıllı kısa devre: Ham okuma zaten çok temizse ek ön-işleme yapma (0ms ek yük!)
-            if best_text and best_conf >= 0.85 and best_score >= 0.72 and len(best_text) >= 6:
+            # Akıllı kısa devre: Ham okuma zaten temizse (~35ms) ek ön-işleme yapma (0ms ek yük!)
+            if best_text and best_conf >= 0.78 and len(best_text) >= 4:
                 self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
                 return best_text
 
-            # Aday 2: Nino Beyaz Harf Yalıtımı (hızlı 1D CRNN ~35ms)
+            # Aday 2: Nino Beyaz Harf Yalıtımı (sadece ham okuma zayıfsa, hızlı 1D CRNN ~35ms)
             white_view = self._make_white_isolated_view(rgb_arr)
             if int(np.count_nonzero(white_view[:, :, 0] < 128)) >= 30:
                 w_text, w_conf = self._run_fast_1d_ocr(white_view)
                 w_score = self._score_english_readability(w_text, w_conf)
                 if w_score > best_score:
-                    best_text, best_score = w_text, w_score
+                    best_text, best_conf, best_score = w_text, w_conf, w_score
 
-            # Aday 3: Nino Otomatik Kontrast Germe (sadece hala zayıfsa, hızlı 1D CRNN ~35ms)
-            if best_score < 0.62:
+            # Aday 3: Nino Otomatik Kontrast Germe (sadece hala zayıfsa)
+            if best_conf < 0.72 and best_score < 0.58:
                 auto_view = self._make_auto_level_view(rgb_arr)
                 a_text, a_conf = self._run_fast_1d_ocr(auto_view)
                 a_score = self._score_english_readability(a_text, a_conf)
                 if a_score > best_score:
-                    best_text, best_score = a_text, a_score
+                    best_text, best_conf, best_score = a_text, a_conf, a_score
 
             # Garantili Tek Seferlik 2D DBNet Yedeği (1D adaylarının hiçbiri tatmin etmediyse)
-            if best_score < 0.55:
+            if not best_text or (best_conf < 0.62 and best_score < 0.52):
                 db_blocks = self.detect_and_read_blocks(rgb_arr, min_conf=self.min_confidence, max_side=640)
                 if db_blocks:
                     db_blocks.sort(key=lambda item: (item[1][1] // 18, item[1][0]))

@@ -11,7 +11,10 @@ import mss
 import numpy as np
 from PIL import Image
 
-from replikai.core.game_window import map_region_to_game_window
+from replikai.core.game_window import (
+    is_game_active_in_foreground,
+    map_region_to_game_window,
+)
 
 
 class ScreenCapturer:
@@ -134,8 +137,9 @@ class ScreenCapturer:
         if not force and diff_score < diff_threshold:
             return None, diff_score
 
-        # Hızlı 1x 45ms pop-in animasyon dengeleyici
-        if not force:
+        # YouTube/video kelime-kelime pop-in animasyonu için 45ms bekle;
+        # oyunlarda altyazı tek karede anında çıktığı için 0ms bekle (anlık tepki!)
+        if not force and not is_game_active_in_foreground(target_hwnd):
             time.sleep(0.045)
             sct_next = sct.grab(monitor)
             bgra_next = np.asarray(sct_next, dtype=np.uint8)

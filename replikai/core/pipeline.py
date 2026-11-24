@@ -572,22 +572,39 @@ class TranslationPipeline:
                 )
 
             self._menu_patches = patches
+            if force_full_menu and patches:
+                # Alt+M ile manuel menü çevrildiyse menü modunu işaretle ve eski ESC mandalını temizle;
+                # böylece kullanıcı tekrar ESC'ye basıp oyuna döndüğü AN (<35ms) tüm yazılar silinir!
+                self._in_menu_mode = True
+                self._esc_menu_toggle = True
+                self._last_esc_time = time.perf_counter()
+                is_escape_key_pressed()
             if self.on_hud_patches:
                 self.on_hud_patches(list(self._menu_patches))
             return list(self._menu_patches)
 
+    def _clear_menu_patches_immediately(self) -> None:
+        """ESC ile oyuna dönüldüğü an menü yamalarını beklemeden (<35ms) ekrandan siler."""
+        self._in_menu_mode = False
+        self._esc_menu_toggle = False
+        self._menu_patches = []
+        self._last_menu_fp = None
+        self._pending_menu_fp = None
+        self._corner_last_mask_fp = None
+        if self.on_hud_patches:
+            self.on_hud_patches([])
+
     def _loop(self) -> None:
-        """Katman 1: Hızlı, Sıfır-Blokajlı Altyazı Kanalı."""
+        """Katman 1: Ultra-Hızlı (~65ms), Sıfır-Blokajlı Anlık Altyazı Kanalı."""
         tick_counter = 0
         while self._running:
             t_start = time.perf_counter()
             tick_counter += 1
-            if tick_counter % 25 == 1:
+            if tick_counter % 40 == 1:
                 self._auto_detect_game_hwnd()
-            if tick_counter % 65 == 0:
+            if tick_counter % 110 == 0:
                 threading.Thread(target=self.translator.warmup, daemon=True).start()
             try:
-                # Menü modundayken (tüm ekran zaten Katman 3 tarafından çevrilmişken) altyazıyı duraklat
                 if not self._in_menu_mode:
                     with self._sub_lock:
                         self.process_single_frame(force=False)
@@ -596,9 +613,10 @@ class TranslationPipeline:
                     self.on_status(f"Hata: {exc}")
 
             elapsed = time.perf_counter() - t_start
-            base_interval = max(0.12, float(self.config.scan_interval_ms) / 1000.0)
-            adaptive_interval = min(0.24, base_interval * 1.3) if self._idle_cycles >= 20 else base_interval
-            sleep_for = max(0.03, adaptive_interval - elapsed)
+            # Küçük altyazı şeridi (<0.7ms GDI) için 65ms anlık tarama (boşta 110ms)
+            base_interval = min(0.065, max(0.055, float(self.config.scan_interval_ms) / 3000.0))
+            adaptive_interval = 0.110 if self._idle_cycles >= 25 else base_interval
+            sleep_for = max(0.020, adaptive_interval - elapsed)
             time.sleep(sleep_for)
 
     def _hud_loop(self) -> None:
@@ -651,14 +669,8 @@ class TranslationPipeline:
                     else:
                         self.process_game_hud_frame(force_full_menu=False)
                 else:
-                    if self._in_menu_mode:
-                        self._in_menu_mode = False
-                        self._menu_patches = []
-                        self._last_menu_fp = None
-                        self._pending_menu_fp = None
-                        self._corner_last_mask_fp = None
-                        if self.on_hud_patches:
-                            self.on_hud_patches([])
+                    if self._in_menu_mode or self._menu_patches:
+                        self._clear_menu_patches_immediately()
 
                     # KATMAN 2: Canlı oynanışta hafif sol-üst bilgi kartı köşesini izle (~0.5ms)
                     with self._hud_lock:
@@ -668,14 +680,19 @@ class TranslationPipeline:
 
             elapsed = time.perf_counter() - t_start
             target_sleep = 0.45 if self._in_menu_mode else 0.65
-            remaining = max(0.10, target_sleep - elapsed)
-            steps = max(1, int(remaining / 0.06))
+            remaining = max(0.08, target_sleep - elapsed)
+            steps = max(1, int(remaining / 0.035))
             for _ in range(steps):
                 if not self._running:
                     break
-                if (time.perf_counter() - self._last_esc_time) > 0.65 and is_escape_key_pressed():
-                    esc_pending = True
+                if (time.perf_counter() - self._last_esc_time) > 0.35 and is_escape_key_pressed():
+                    if self._in_menu_mode or self._menu_patches:
+                        # Menüden ESC ile çıkıldığı AN (<35ms) yazıları ekrandan sil!
+                        self._last_esc_time = time.perf_counter()
+                        self._clear_menu_patches_immediately()
+                    else:
+                        esc_pending = True
                     break
                 if is_cursor_visible() != self._in_menu_mode:
                     break
-                time.sleep(0.06)
+                time.sleep(0.035)
