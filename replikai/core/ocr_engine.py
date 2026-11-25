@@ -68,10 +68,12 @@ class OCREngine:
     def warmup(self) -> None:
         self._ensure_initialized()
         if self._rapid_ocr:
-            dummy = np.zeros((24, 240, 3), dtype=np.uint8)
+            dummy_1d = np.zeros((24, 240, 3), dtype=np.uint8)
+            dummy_2d = np.zeros((64, 256, 3), dtype=np.uint8)
             with self._lock:
                 try:
-                    self._rapid_ocr(dummy, use_det=False, use_cls=False, use_rec=True)
+                    self._rapid_ocr(dummy_1d, use_det=False, use_cls=False, use_rec=True)
+                    self._rapid_ocr(dummy_2d, use_det=True, use_cls=False, use_rec=True)
                 except Exception:
                     pass
 
@@ -337,16 +339,16 @@ class OCREngine:
         try:
             rgb_arr = np.asarray(image.convert("RGB"))
 
-            # Aday 1: Ham görüntü (hızlı 1D CRNN ~30-35ms)
+            # Aday 1: Ham görüntü (hızlı 1D CRNN ~25-35ms)
             best_text, best_conf = self._run_fast_1d_ocr(rgb_arr)
             best_score = self._score_english_readability(best_text, best_conf)
 
-            # Akıllı kısa devre: Ham okuma zaten temizse (~35ms) ek ön-işleme yapma (0ms ek yük!)
-            if best_text and best_conf >= 0.78 and len(best_text) >= 4:
+            # Ultra-Hızlı Kısa Devre: Ham okuma yeterince temizse (~30ms) anında dön!
+            if best_text and best_conf >= 0.72 and len(best_text) >= 3:
                 self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
                 return best_text
 
-            # Aday 2: Nino Beyaz Harf Yalıtımı (sadece ham okuma zayıfsa, hızlı 1D CRNN ~35ms)
+            # Aday 2: Nino Beyaz Harf Yalıtımı (güneşli sarı kaldırım / açık zemin, hızlı 1D CRNN ~30ms)
             white_view = self._make_white_isolated_view(rgb_arr)
             if int(np.count_nonzero(white_view[:, :, 0] < 128)) >= 30:
                 w_text, w_conf = self._run_fast_1d_ocr(white_view)
@@ -354,17 +356,13 @@ class OCREngine:
                 if w_score > best_score:
                     best_text, best_conf, best_score = w_text, w_conf, w_score
 
-            # Aday 3: Nino Otomatik Kontrast Germe (sadece hala zayıfsa)
-            if best_conf < 0.72 and best_score < 0.58:
-                auto_view = self._make_auto_level_view(rgb_arr)
-                a_text, a_conf = self._run_fast_1d_ocr(auto_view)
-                a_score = self._score_english_readability(a_text, a_conf)
-                if a_score > best_score:
-                    best_text, best_conf, best_score = a_text, a_conf, a_score
+            if best_text and best_conf >= 0.68 and len(best_text) >= 3:
+                self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
+                return best_text
 
-            # Garantili Tek Seferlik 2D DBNet Yedeği (1D adaylarının hiçbiri tatmin etmediyse)
-            if not best_text or (best_conf < 0.62 and best_score < 0.52):
-                db_blocks = self.detect_and_read_blocks(rgb_arr, min_conf=self.min_confidence, max_side=640)
+            # Garantili Tek Seferlik Hızlı 2D DBNet Yedeği (max_side=480 -> ~130ms, sadece 1D boş/zayıf kaldıysa)
+            if not best_text or best_conf < 0.58:
+                db_blocks = self.detect_and_read_blocks(rgb_arr, min_conf=self.min_confidence, max_side=480)
                 if db_blocks:
                     db_blocks.sort(key=lambda item: (item[1][1] // 18, item[1][0]))
                     if len(db_blocks) == 2 and DialogueTextGrouper.is_speaker_label_line(

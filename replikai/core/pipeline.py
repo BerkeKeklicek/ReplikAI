@@ -546,6 +546,11 @@ class TranslationPipeline:
             self._pending_menu_fp = menu_fp
             self._last_menu_fp = menu_fp
 
+            if force_full_menu and self._menu_patches:
+                # Alt+M tekrar basıldıysa mevcut menü yamalarını anında kapat (Toggle)
+                self._clear_menu_patches_immediately()
+                return []
+
             # Gerçek 2D DBNet (`use_det=True`) ile TAM EKRAN tarama (14 kutu limiti YOK!)
             raw_blocks = self.ocr.detect_and_read_blocks(full_rgb, min_conf=0.55, max_side=1280)
             if not raw_blocks:
@@ -572,19 +577,17 @@ class TranslationPipeline:
                 )
 
             self._menu_patches = patches
-            if force_full_menu and patches:
-                # Alt+M ile manuel menü çevrildiyse menü modunu işaretle ve eski ESC mandalını temizle;
-                # böylece kullanıcı tekrar ESC'ye basıp oyuna döndüğü AN (<35ms) tüm yazılar silinir!
+            if patches:
                 self._in_menu_mode = True
-                self._esc_menu_toggle = True
                 self._last_esc_time = time.perf_counter()
+                # Eski ESC tuş mandalını temizle ki sonraki ESC basışında (<30ms) yamalar anında silinsin
                 is_escape_key_pressed()
             if self.on_hud_patches:
                 self.on_hud_patches(list(self._menu_patches))
             return list(self._menu_patches)
 
     def _clear_menu_patches_immediately(self) -> None:
-        """ESC ile oyuna dönüldüğü an menü yamalarını beklemeden (<35ms) ekrandan siler."""
+        """ESC veya Alt+M ile menüden çıkıldığı an yamaları beklemeden (<30ms) ekrandan siler."""
         self._in_menu_mode = False
         self._esc_menu_toggle = False
         self._menu_patches = []
@@ -595,104 +598,68 @@ class TranslationPipeline:
             self.on_hud_patches([])
 
     def _loop(self) -> None:
-        """Katman 1: Ultra-Hızlı (~65ms), Sıfır-Blokajlı Anlık Altyazı Kanalı."""
+        """
+        Katman 1: Ultra-Hızlı (~50ms), ASLA DURMAYAN Anlık Altyazı Kanalı.
+        Menü veya radyo tekeri durumlarından tamamen bağımsızdır; oyun boyunca asla kilitlenmez!
+        """
         tick_counter = 0
         while self._running:
             t_start = time.perf_counter()
             tick_counter += 1
-            if tick_counter % 40 == 1:
+            if tick_counter % 50 == 1:
                 self._auto_detect_game_hwnd()
-            if tick_counter % 110 == 0:
+            if tick_counter % 150 == 0:
                 threading.Thread(target=self.translator.warmup, daemon=True).start()
             try:
-                if not self._in_menu_mode:
-                    with self._sub_lock:
-                        self.process_single_frame(force=False)
+                with self._sub_lock:
+                    self.process_single_frame(force=False)
             except Exception as exc:
                 if self.on_status:
                     self.on_status(f"Hata: {exc}")
 
             elapsed = time.perf_counter() - t_start
-            # Küçük altyazı şeridi (<0.7ms GDI) için 65ms anlık tarama (boşta 110ms)
-            base_interval = min(0.065, max(0.055, float(self.config.scan_interval_ms) / 3000.0))
-            adaptive_interval = 0.110 if self._idle_cycles >= 25 else base_interval
-            sleep_for = max(0.020, adaptive_interval - elapsed)
+            # Küçük altyazı şeridi (<0.6ms GDI) için 50ms anlık tarama (boşta 90ms)
+            base_interval = 0.050
+            adaptive_interval = 0.090 if self._idle_cycles >= 30 else base_interval
+            sleep_for = max(0.015, adaptive_interval - elapsed)
             time.sleep(sleep_for)
 
     def _hud_loop(self) -> None:
         """
-        Katman 2 & Katman 3 Akıllı Yönetici:
-        - `GetCursorInfo` ile fare imleci GÖRÜNÜR olduğu an (ESC, M, I, Tab, J hangi tuş olursa olsun!)
-          otomatik olarak Katman 3 (Tam Ekran 2D DBNet Menü Tarayıcı) moduna geçer.
-        - İmleç GİZLİ olduğunda (3D canlı oynanış) tüm menü yamalarını anında siler ve sadece
-          Katman 2 (Hafif Sol-Üst Köşe Bilgi Kartı Radarı) çalışır (%0 FPS düşüşü!).
+        Katman 2 (Sol-Üst Bilgi Kartı) & Katman 3 (Sadece Manuel Alt+M Menü) Yöneticisi:
+        - Otomatik imleç/ESC tetiklemesi KALDIRILDI: Q radyo tekeri veya silah çarkı ASLA yanlış tetiklenmez!
+        - Kullanıcı menü çevirmek istediğinde `Alt + M` basar; `ESC` (veya tekrar `Alt + M`) bastığı AN
+          (<30ms) tüm menü yamaları ekrandan anında silinir.
+        - Normal oynanışta yalnızca hafif Katman 2 (Sol-Üst Köşe Bilgi Kartı) çalışır.
         """
-        esc_pending = False
         while self._running:
             t_start = time.perf_counter()
             try:
                 game_fg = self.config.enable_game_hud_radar and is_game_active_in_foreground(self.target_hwnd)
                 if not game_fg:
-                    esc_pending = False
                     if self._in_menu_mode or self._menu_patches or self._corner_patches:
-                        self._in_menu_mode = False
-                        self._esc_menu_toggle = False
-                        self._menu_patches = []
+                        self._clear_menu_patches_immediately()
                         self._corner_patches = []
-                        self._last_menu_fp = None
-                        self._pending_menu_fp = None
-                        if self.on_hud_patches:
-                            self.on_hud_patches([])
-                    time.sleep(0.35)
+                    time.sleep(0.30)
                     continue
 
-                cursor_now = is_cursor_visible()
-                now_t = time.perf_counter()
-                esc_hit = esc_pending or ((now_t - self._last_esc_time) > 0.65 and is_escape_key_pressed())
-                esc_pending = False
-                if esc_hit:
-                    self._last_esc_time = now_t
-                    # GTA 5 gibi kendi DirectX imlecini çizen oyunlarda ESC aç/kapa durumunu takip et
-                    self._esc_menu_toggle = not self._esc_menu_toggle
-
-                should_be_menu = cursor_now or self._esc_menu_toggle
-
-                # KATMAN 3: İmleç görünürse (Witcher/Cyberpunk/BG3) VEYA ESC ile menü açıldıysa (GTA 5/RDR 2)
-                if should_be_menu:
-                    if not self._in_menu_mode:
-                        self._in_menu_mode = True
-                        self._corner_patches = []
-                        self._last_menu_fp = None
-                        self._pending_menu_fp = None
-                        time.sleep(0.24)
-                        self.process_game_hud_frame(force_full_menu=True)
-                    else:
-                        self.process_game_hud_frame(force_full_menu=False)
-                else:
-                    if self._in_menu_mode or self._menu_patches:
-                        self._clear_menu_patches_immediately()
-
-                    # KATMAN 2: Canlı oynanışta hafif sol-üst bilgi kartı köşesini izle (~0.5ms)
+                if not self._menu_patches:
+                    # KATMAN 2: Canlı oynanışta sadece hafif sol-üst bilgi kartı köşesini izle (~0.5ms)
                     with self._hud_lock:
                         self._scan_corner_info_cards()
             except Exception:
                 pass
 
             elapsed = time.perf_counter() - t_start
-            target_sleep = 0.45 if self._in_menu_mode else 0.65
-            remaining = max(0.08, target_sleep - elapsed)
-            steps = max(1, int(remaining / 0.035))
+            target_sleep = 0.25 if self._menu_patches else 0.65
+            remaining = max(0.06, target_sleep - elapsed)
+            steps = max(1, int(remaining / 0.030))
             for _ in range(steps):
                 if not self._running:
                     break
-                if (time.perf_counter() - self._last_esc_time) > 0.35 and is_escape_key_pressed():
-                    if self._in_menu_mode or self._menu_patches:
-                        # Menüden ESC ile çıkıldığı AN (<35ms) yazıları ekrandan sil!
-                        self._last_esc_time = time.perf_counter()
-                        self._clear_menu_patches_immediately()
-                    else:
-                        esc_pending = True
+                if self._menu_patches and (time.perf_counter() - self._last_esc_time) > 0.25 and is_escape_key_pressed():
+                    # Alt+M sonrası ESC'ye basıldığı AN (<30ms) menü yamalarını anında sil!
+                    self._last_esc_time = time.perf_counter()
+                    self._clear_menu_patches_immediately()
                     break
-                if is_cursor_visible() != self._in_menu_mode:
-                    break
-                time.sleep(0.035)
+                time.sleep(0.030)

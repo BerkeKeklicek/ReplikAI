@@ -44,15 +44,15 @@ ReplikAI, canlı oynanış performansını korurken menülerde `%99+` kapsama sa
 
 | Katman | Görev | Nasıl Çalışır? | Gecikme / FPS Etkisi |
 | :--- | :--- | :--- | :--- |
-| **1. Katman — Canlı Altyazı Motoru** | Oyun içi sinematik diyaloglar ve tam ekran video altyazıları | Evrensel alt-orta altyazı bandını (`65ms` döngü) izler. Çoklu ön-işleme (`Ham` + `Beyaz Harf Yalıtımı` + `Otomatik Kontrast`) + İngilizce okunabilirlik puanlaması ve garantili 2D DBNet yedeğiyle güneşli zeminlerde bile 1-3 satırlık altyazıları okur. | `~160–200 ms` toplam tepki • **%0 FPS kaybı** |
+| **1. Katman — Canlı Altyazı Motoru** | Oyun içi sinematik diyaloglar ve tam ekran video altyazıları | Evrensel alt-orta altyazı bandını (`50ms` döngü) kesintisiz izler. Çoklu ön-işleme (`Ham` + `Beyaz Harf Yalıtımı`) + İngilizce okunabilirlik puanlaması ve sıcak 2D DBNet yedeğiyle güneşli zeminlerde bile 1-3 satırlık altyazıları okur. | `~120–180 ms` toplam tepki • **%0 FPS kaybı** |
 | **2. Katman — Köşe Bilgi Kartı Radarı** | Sol-üstte aniden çıkan görev/ipucu/uyarı kutuları | Tüm ekran yerine yalnızca sol-üst köşe şeridini (`~%9` ekran) izler. Harf-ritmi maskesiyle hareketli 3D sahnede bile bilgi kartını yakalar; `CornerBlock` filtresiyle harita/gürültü etiketlerini eler ve 2D DBNet ile yerinde (**In-Place**) çevirir. | `~0.5 ms` tarama • **~%0 FPS kaybı** |
-| **3. Katman — Tam Ekran Menü / Envanter Tarayıcı** | `ESC` menüleri, ayarlar, harita, envanter ve diyalog özetleri | `GetCursorInfo` (imleç görünürlüğü), `ESC` tuş mandalı (`0x8001`) veya `Alt + M` ile tetiklenir. Gerçek **2D DBNet** + limitsiz **Toplu (Batch) Çeviri** ile ekrandaki tüm kelimeleri tek seferde çevirir. `ESC` ile oyuna dönüldüğü an (`< 35ms`) tüm yamaları temizler. | Tek seferlik toplu çeviri • **%0 FPS kaybı** |
+| **3. Katman — İsteğe Bağlı Tam Ekran Menü Tarayıcı (`Alt + M`)** | `ESC` menüleri, ayarlar, harita, envanter ve diyalog özetleri | Yalnızca kullanıcının istediği anda **`Alt + M`** ile tetiklenir (radyo/silah tekerinde yanlış tetiklenmez). Gerçek **2D DBNet** + limitsiz **Toplu (Batch) Çeviri** ile tüm ekranı tek seferde çevirir. `ESC` veya tekrar `Alt + M` basıldığı an (`< 30ms`) tüm yamaları temizler. | Tek seferlik toplu çeviri • **%0 FPS kaybı** |
 
 ```mermaid
 flowchart LR
-    A["Oyun / Video Ekranı"] --> B["Katman 1: Altyazı Şeridi (65ms)"]
+    A["Oyun / Video Ekranı"] --> B["Katman 1: Altyazı Şeridi (50ms)"]
     A --> C["Katman 2: Sol-Üst Bilgi Köşesi"]
-    A --> D["Katman 3: Tam Ekran Menü (ESC / Alt+M)"]
+    A --> D["Katman 3: Tam Ekran Menü (Alt+M)"]
 
     B --> E["Çoklu Ön-İşleme + RapidOCR + FrameGate"]
     C --> F["2D DBNet + CornerBlock Filtresi"]
@@ -114,7 +114,7 @@ python main.py
 | Kısayol | İşlev |
 | :--- | :--- |
 | **`Alt + T`** | Canlı Altyazı & HUD Takibini Başlat / Durdur |
-| **`Alt + M`** | Ekrandaki Tüm Menü / Harita / Envanter Metinlerini Tek Tuşla Çevir (ESC'ye basınca `<35ms` içinde silinir) |
+| **`Alt + M`** | Ekrandaki Tüm Menü / Harita / Envanter Metinlerini Tek Tuşla Çevir / Kapat (`ESC` basınca `<30ms` içinde silinir) |
 | **`Alt + R`** | Lazer HUD Bölge Seçici ile Özel Altyazı Alanı Çiz |
 | **`Alt + L`** | Altyazı Katmanını Kilitle (Hayalet Tıklama Geçirgen Mod) / Kilidi Açıp Taşı |
 | **`Alt + C`** | Anlık Tek Kare Altyazı Çevir |
@@ -154,7 +154,7 @@ ReplikAI/
 │   │   ├── capture.py               # MSS kalıcı oturumlu yakalayıcı & çift kanallı Top-Hat/Comb altyazı maskesi
 │   │   ├── ocr_engine.py            # RapidOCR ONNX + 2-satır vadi ayırıcı + çoklu ön-işleme + 2D DBNet motoru
 │   │   ├── translator.py            # Bağlamsal AI (Gemini, OpenAI, Ollama, Google Fast) & Toplu (Batch) çeviri
-│   │   ├── pipeline.py              # 3 Katmanlı Hibrit iş hattı (Altyazı + Köşe Bilgi Kartı + Otomatik Menü)
+│   │   ├── pipeline.py              # 3 Katmanlı Hibrit iş hattı (Kesintisiz Altyazı + Köşe Bilgi Kartı + Manuel Alt+M Menü)
 │   │   ├── hud_radar.py             # 2D DBNet blok gruplayıcı, parmak izi takibi ve anlık oyun terimleri sözlüğü
 │   │   ├── natural_patch.py         # Doğal arka plan doku yaması (Inpainting) & WCAG 2.0 / HSL renk örnekleyici
 │   │   ├── dialogue_grouper.py      # Konuşmacı adı ayırıcı (SpeakerLabel), paragraf birleştirici & CornerBlock filtresi
