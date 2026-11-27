@@ -348,6 +348,12 @@ class TranslationPipeline:
         if not cleaned:
             return None
 
+        # 3D yol/plaka/far yansıması gürültüsünün (ör. "IIl", "00", "||") ağa gidip kota harcamasını engelle:
+        alpha_chars = [c for c in cleaned if c.isalpha()]
+        has_vowel = any(c.lower() in "aeiouy" for c in alpha_chars)
+        if len(alpha_chars) < 3 or not has_vowel:
+            return None
+
         self._empty_ticks = 0
         if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
             return None

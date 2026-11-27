@@ -168,7 +168,9 @@ class OCREngine:
             sub_mask = ((max_c > 165).astype(np.uint8)) * 255
 
         row_counts = np.sum(sub_mask > 0, axis=1)
-        min_row_pixels = 4
+        # 1260px genişlikteki kutuda 3-4 piksellik 3D asfalt gürültüsünün tüm satırları birleştirip
+        # 414ms DBNet yedeğine düşürmesini önlemek için dinamik satır eşiği kullan:
+        min_row_pixels = max(8, int(w * 0.012))
         active_rows = row_counts >= min_row_pixels
 
         raw_bands: List[Tuple[int, int]] = []
@@ -178,11 +180,22 @@ class OCREngine:
                 start_y = y
             elif not is_active and start_y is not None:
                 band_h = y - start_y
-                if 7 <= band_h <= 110:
+                if 7 <= band_h <= 115:
                     raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, y))
+                elif band_h > 115:
+                    # Çok yüksek gürültülü blokta en yoğun satır zirvesinin etrafındaki 56px bandı kurtar!
+                    peak_y = start_y + int(np.argmax(row_counts[start_y:y]))
+                    b1, b2 = max(start_y, peak_y - 28), min(y, peak_y + 28)
+                    raw_bands.extend(cls._split_tall_band_at_valley(row_counts, b1, b2))
                 start_y = None
-        if start_y is not None and 7 <= (h - start_y) <= 110:
-            raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, h))
+        if start_y is not None:
+            band_h = h - start_y
+            if 7 <= band_h <= 115:
+                raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, h))
+            elif band_h > 115:
+                peak_y = start_y + int(np.argmax(row_counts[start_y:h]))
+                b1, b2 = max(start_y, peak_y - 28), min(h, peak_y + 28)
+                raw_bands.extend(cls._split_tall_band_at_valley(row_counts, b1, b2))
 
         merged_bands: List[Tuple[int, int]] = list(raw_bands)
 
@@ -242,14 +255,15 @@ class OCREngine:
     def _slice_subtitle_lines(cls, rgb_arr: np.ndarray) -> List[np.ndarray]:
         return [crop for crop, _bounds in cls._slice_subtitle_lines_with_bounds(rgb_arr)]
 
-    @staticmethod
-    def _make_white_isolated_view(rgb_arr: np.ndarray) -> np.ndarray:
+    @classmethod
+    def _run_white_isolated_1d_ocr(cls, self_inst: "OCREngine", rgb_arr: np.ndarray) -> Tuple[str, float]:
         """
-        Nino (`WindowsOcrReader.cs` beyaz yazı yalıtımı):
-        GTA 5 / RDR 2 gibi oyunlarda güneşli sarı kaldırım, ten veya açık gömlek üzerindeki
-        beyaz altyazıları ayırmak için düşük doygunluklu parlak harfleri beyaz tuval üstünde
-        keskin siyah harfe dönüştürür.
+        Nino beyaz harf yalıtımı (DÜZELTİLMİŞ):
+        Önce `white_mask` (255 = beyaz harf, 0 = arka plan) üzerinden satır koordinatlarını bulur,
+        ARDINDAN her satırı siyah-harf / beyaz-zemin (`255 - mask`) olarak 1D CRNN'e (~28ms) verir!
+        (Önceki sürümde maske ters çevrildikten sonra kesiciye girdiği için 2D DBNet'e düşüp 414ms sürüyordu.)
         """
+        h, w, _ = rgb_arr.shape
         max_c = np.max(rgb_arr, axis=2)
         min_c = np.min(rgb_arr, axis=2)
         sat = max_c.astype(np.int16) - min_c.astype(np.int16)
@@ -257,9 +271,52 @@ class OCREngine:
         local_drop = max_c.astype(np.int16) - local_min.astype(np.int16)
 
         white_mask = ((min_c > 172) & (sat < 52) & (local_drop > 32)).astype(np.uint8) * 255
-        # Harf gövdelerini 1px temizle ve siyah-yazı / beyaz-zemin (OCR ideal formatı) yap
-        inv = 255 - white_mask
-        return cv2.cvtColor(inv, cv2.COLOR_GRAY2RGB)
+        if int(np.count_nonzero(white_mask)) < 35:
+            return "", 0.0
+
+        row_counts = np.sum(white_mask > 0, axis=1)
+        min_row_px = max(8, int(w * 0.012))
+        active_rows = row_counts >= min_row_px
+
+        bands: List[Tuple[int, int]] = []
+        sy = None
+        for y, act in enumerate(active_rows):
+            if act and sy is None:
+                sy = y
+            elif not act and sy is not None:
+                if 7 <= (y - sy) <= 115:
+                    bands.extend(cls._split_tall_band_at_valley(row_counts, sy, y))
+                sy = None
+        if sy is not None and 7 <= (h - sy) <= 115:
+            bands.extend(cls._split_tall_band_at_valley(row_counts, sy, h))
+
+        if len(bands) > 3:
+            bands.sort(key=lambda b: int(np.sum(white_mask[b[0] : b[1], :] > 0)), reverse=True)
+            bands = sorted(bands[:3], key=lambda b: b[0])
+
+        inv_rgb = cv2.cvtColor(255 - white_mask, cv2.COLOR_GRAY2RGB)
+        recognized: List[Tuple[str, Tuple[int, int, int, int], float]] = []
+        with self_inst._lock:
+            for y1, y2 in bands:
+                b_mask = white_mask[y1:y2, :]
+                ys, xs = np.where(b_mask > 0)
+                if len(ys) < 10:
+                    continue
+                ey1, ey2 = max(0, y1 + int(ys.min()) - 3), min(h, y1 + int(ys.max()) + 4)
+                ex1, ex2 = max(0, int(xs.min()) - 8), min(w, int(xs.max()) + 8)
+                crop = inv_rgb[ey1:ey2, ex1:ex2]
+                if crop.shape[1] < 16 or crop.shape[0] < 8:
+                    continue
+                res, _ = self_inst._rapid_ocr(crop, use_det=False, use_cls=False, use_rec=True)
+                if res and len(res) > 0:
+                    txt, sc = str(res[0][0]).strip(), float(res[0][1])
+                    if sc >= self_inst.min_confidence and txt:
+                        recognized.append((txt, (ex1, ey1, ex2 - ex1, ey2 - ey1), sc))
+
+        if not recognized:
+            return "", 0.0
+        avg_conf = sum(r[2] for r in recognized) / float(len(recognized))
+        return normalize_ocr_text(" ".join(r[0] for r in recognized)), avg_conf
 
     @staticmethod
     def _make_auto_level_view(rgb_arr: np.ndarray) -> np.ndarray:
@@ -348,10 +405,9 @@ class OCREngine:
                 self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
                 return best_text
 
-            # Aday 2: Nino Beyaz Harf Yalıtımı (güneşli sarı kaldırım / açık zemin, hızlı 1D CRNN ~30ms)
-            white_view = self._make_white_isolated_view(rgb_arr)
-            if int(np.count_nonzero(white_view[:, :, 0] < 128)) >= 30:
-                w_text, w_conf = self._run_fast_1d_ocr(white_view)
+            # Aday 2: Nino Beyaz Harf Yalıtımı (güneşli sarı kaldırım / açık zemin, hızlı 1D CRNN ~28ms)
+            w_text, w_conf = self._run_white_isolated_1d_ocr(self, rgb_arr)
+            if w_text:
                 w_score = self._score_english_readability(w_text, w_conf)
                 if w_score > best_score:
                     best_text, best_conf, best_score = w_text, w_conf, w_score

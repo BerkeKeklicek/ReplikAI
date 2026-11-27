@@ -108,8 +108,13 @@ class ScreenCapturer:
         sub_mask = self.extract_outlined_subtitle_mask(rgb_arr)
         active_pixels = int(np.count_nonzero(sub_mask))
 
+        # Gerçek bir altyazı satırı en az 12px dikey bant içinde yoğunlaşmış harf enerjisine sahiptir;
+        # yoldaki dağınık araba farı / şerit çizgisi gürültüsünün sahte OCR ve HTTP 429 üretmesini engeller!
+        row_counts = np.sum(sub_mask > 0, axis=1).astype(np.float32)
+        band_energy = float(np.max(np.convolve(row_counts, np.ones(12, dtype=np.float32), mode="same"))) if len(row_counts) >= 12 else float(active_pixels)
+
         # Ekranda hiç altyazı yoksa (ör. GTA 5'te kimse konuşmuyorsa)
-        if not force and active_pixels < 30:
+        if not force and (active_pixels < 60 or band_energy < 50.0):
             self.subtitle_currently_visible = False
             self._last_subtitle_mask_small = None
             return None, 0.0
