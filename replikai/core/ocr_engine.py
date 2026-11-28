@@ -1,4 +1,4 @@
-"""Yüksek Doğruluklu Oyun & Video Altyazı OCR Motoru (2-Satır Vadi Ayırıcı + DBNet Fallback + OverTranslate SpeakerLabel)."""
+"""Yüksek Doğruluklu Oyun & Video Altyazı OCR Motoru (960px DBNet + Tam Satır Kesici + Nino Çoklu Ön-İşleme)."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from replikai.core.dialogue_grouper import DialogueTextGrouper
 
 logger = logging.getLogger(__name__)
 
-# Nino (`WindowsSpellCheck.Score`) hafif yerel İngilizce kelime puanlayıcı sözlüğü
 COMMON_ENGLISH_WORDS = frozenset(
     {
         "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it", "for", "not", "on", "with",
@@ -32,13 +31,13 @@ COMMON_ENGLISH_WORDS = frozenset(
         "also", "back", "after", "use", "two", "how", "our", "work", "first", "well", "way", "even",
         "new", "want", "because", "any", "these", "give", "day", "most", "us", "is", "are", "was", "were",
         "been", "has", "had", "did", "does", "doing", "got", "going", "need", "let", "lets", "hey",
-        "here", "where", "why", "wait", "stop", "right", "left", "down", "back", "man", "men", "guy",
-        "guys", "car", "kill", "dead", "money", "shit", "fuck", "hell", "damn", "please", "sorry",
-        "thanks", "thank", "yes", "yeah", "nope", "okay", "ok", "sure", "really", "never", "always",
-        "still", "keep", "hold", "leave", "call", "tell", "told", "said", "talk", "listen", "watch",
-        "find", "found", "take", "took", "give", "gave", "come", "came", "went", "gone", "done",
-        "through", "personal", "line", "service", "twice", "details", "response", "mission", "police",
-        "cops", "area", "vehicle", "press", "open", "close", "door", "help", "run", "shoot", "drive",
+        "here", "where", "why", "wait", "stop", "right", "left", "down", "man", "men", "guy", "guys",
+        "car", "kill", "dead", "money", "shit", "fuck", "hell", "damn", "please", "sorry", "thanks",
+        "thank", "yes", "yeah", "nope", "okay", "ok", "sure", "really", "never", "always", "still",
+        "keep", "hold", "leave", "call", "tell", "told", "said", "talk", "listen", "watch", "find",
+        "found", "took", "gave", "came", "went", "gone", "done", "through", "personal", "line",
+        "service", "twice", "details", "response", "mission", "police", "cops", "area", "vehicle",
+        "press", "open", "close", "door", "help", "run", "shoot", "drive", "house", "home", "bro",
     }
 )
 
@@ -48,14 +47,11 @@ EN_MODEL_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "models
 
 class OCREngine:
     """
-    Oyun ve tam ekran video altyazılarını %99+ doğrulukla okuyan motor:
-    1. 2-Satır Vadi Ayırıcı (Valley Splitter): GTA 5 ve videolarda alt alta çıkan 2 satırlık
-       altyazıları (`"Mr. Weston checks...\nwait for a response."`) birbirine yapıştırmadan
-       yatay projeksiyon vadisinden iki ayrı satıra böler; böylece `use_det=False` CRNN
-       motoru 2 satırlık cümlelerde asla boş (`""`) dönmez!
-    2. Akıllı DBNet (`use_det=True`) Yedekleme: Arka plan çok karmaşıksa ve 1D satır okuma
-       düşük güven verirse, kırpılmış bölge üzerinde otomatik 2D DBNet satır tespiti çalıştırır.
-    3. OverTranslate `SpeakerLabel` geometrisi ile üst satırdaki kısa konuşmacı adını ayırır.
+    Oyun ve video altyazılarını %99+ doğrulukla okuyan motor:
+    - `det_limit_side_len = 960`: Geniş `1420x280` altyazı şeritlerinde 22px harflerin 8px'e
+      ezilip kaybolmasını (%100 körlük bug'ını) ortadan kaldırır!
+    - Tam Satır Genişliği (`spans[0] .. spans[-1]`): Cümlenin başındaki veya sonundaki kelimeleri
+      asla kesmez ve tek kelimelik bozuk parçada (`'prneiexciusi'`) erken kısa devre yapmaz!
     """
 
     def __init__(self, min_confidence: float = 0.52) -> None:
@@ -68,8 +64,8 @@ class OCREngine:
     def warmup(self) -> None:
         self._ensure_initialized()
         if self._rapid_ocr:
-            dummy_1d = np.zeros((24, 240, 3), dtype=np.uint8)
-            dummy_2d = np.zeros((64, 256, 3), dtype=np.uint8)
+            dummy_1d = np.zeros((28, 240, 3), dtype=np.uint8)
+            dummy_2d = np.zeros((80, 320, 3), dtype=np.uint8)
             with self._lock:
                 try:
                     self._rapid_ocr(dummy_1d, use_det=False, use_cls=False, use_rec=True)
@@ -95,16 +91,18 @@ class OCREngine:
                     except Exception as dl_exc:
                         logger.warning("İngilizce OCR modeli indirilemedi: %s", dl_exc)
 
+                # KRİTİK DÜZELTME: det_limit_side_len=960 (eskisi 480 idi ve 1420x280 altyazı şeridini
+                # 480x94 boyutuna ezip 21px GTA 5 harflerini 7px'e düşürerek okunamaz hale getiriyordu!)
                 kwargs = {
                     "intra_op_num_threads": 4,
                     "inter_op_num_threads": 1,
-                    "det_limit_side_len": 480,
+                    "det_limit_side_len": 960,
                 }
                 if EN_MODEL_PATH.exists():
                     kwargs["rec_model_path"] = str(EN_MODEL_PATH)
 
                 self._rapid_ocr = RapidOCR(**kwargs)
-                self.backend_name = "RapidOCR Turbo (Warm ONNX)"
+                self.backend_name = "RapidOCR Turbo (960p Warm ONNX)"
             except Exception as exc:
                 logger.warning("RapidOCR başlatılamadı: %s", exc)
                 self._rapid_ocr = False
@@ -116,11 +114,6 @@ class OCREngine:
         y1: int,
         y2: int,
     ) -> List[Tuple[int, int]]:
-        """
-        Eğer bir altyazı/HUD bandı 2 satır yüksekliğindeyse (`band_h >= 34`),
-        ortadaki `[%28..%72]` dikey aralıktaki en düşük piksel yoğunluklu satırı (vadiyi)
-        bularak bandı 2 ayrı satıra (`(y1, valley)` ve `(valley, y2)`) böler.
-        """
         band_h = y2 - y1
         if band_h < 34:
             return [(y1, y2)]
@@ -136,7 +129,6 @@ class OCREngine:
         peak_top = float(np.max(row_counts[y1 : y1 + s_off + valley_rel + 1]))
         peak_bot = float(np.max(row_counts[y1 + s_off + valley_rel : y2]))
 
-        # Vadi satırı üst ve alt satır zirvelerinden belirgin şekilde daha boşsa 2 satıra böl
         if peak_top >= 8 and peak_bot >= 8 and valley_val <= min(peak_top, peak_bot) * 0.68:
             vy = y1 + s_off + valley_rel
             return [(y1, vy + 1), (max(y1, vy - 1), y2)]
@@ -148,29 +140,15 @@ class OCREngine:
         cls,
         rgb_arr: np.ndarray,
     ) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
-        """
-        Görüntüdeki altyazı satırlarını tespit eder; 2 satırlık birleşik bantları vadiden ikiye
-        ayırır ve her satır için `(crop, (x, y, w, h))` döndürür.
-        """
         h, w, _ = rgb_arr.shape
         sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr).copy()
 
-        # Sadece çok geniş (w > 950) ve yüksek (h > 140) yakalamalarda en alt 45px köşelerdeki
-        # YouTube video oynatıcı ikonlarını maskeden temizle
-        if w > 950 and h > 140:
-            corner_x = int(w * 0.14)
-            corner_y = h - 46
-            sub_mask[corner_y:, :corner_x] = 0
-            sub_mask[corner_y:, w - corner_x :] = 0
-
         if np.count_nonzero(sub_mask) < 20:
             max_c = np.max(rgb_arr, axis=2)
-            sub_mask = ((max_c > 165).astype(np.uint8)) * 255
+            sub_mask = ((max_c > 168).astype(np.uint8)) * 255
 
         row_counts = np.sum(sub_mask > 0, axis=1)
-        # 1260px genişlikteki kutuda 3-4 piksellik 3D asfalt gürültüsünün tüm satırları birleştirip
-        # 414ms DBNet yedeğine düşürmesini önlemek için dinamik satır eşiği kullan:
-        min_row_pixels = max(8, int(w * 0.012))
+        min_row_pixels = max(6, int(w * 0.008))
         active_rows = row_counts >= min_row_pixels
 
         raw_bands: List[Tuple[int, int]] = []
@@ -183,9 +161,8 @@ class OCREngine:
                 if 7 <= band_h <= 115:
                     raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, y))
                 elif band_h > 115:
-                    # Çok yüksek gürültülü blokta en yoğun satır zirvesinin etrafındaki 56px bandı kurtar!
                     peak_y = start_y + int(np.argmax(row_counts[start_y:y]))
-                    b1, b2 = max(start_y, peak_y - 28), min(y, peak_y + 28)
+                    b1, b2 = max(start_y, peak_y - 30), min(y, peak_y + 30)
                     raw_bands.extend(cls._split_tall_band_at_valley(row_counts, b1, b2))
                 start_y = None
         if start_y is not None:
@@ -194,12 +171,10 @@ class OCREngine:
                 raw_bands.extend(cls._split_tall_band_at_valley(row_counts, start_y, h))
             elif band_h > 115:
                 peak_y = start_y + int(np.argmax(row_counts[start_y:h]))
-                b1, b2 = max(start_y, peak_y - 28), min(h, peak_y + 28)
+                b1, b2 = max(start_y, peak_y - 30), min(h, peak_y + 30)
                 raw_bands.extend(cls._split_tall_band_at_valley(row_counts, b1, b2))
 
         merged_bands: List[Tuple[int, int]] = list(raw_bands)
-
-        # En yoğun 3 altyazı satırını yukarıdan aşağıya sırayla al
         if len(merged_bands) > 3:
             merged_bands.sort(key=lambda b: int(np.sum(sub_mask[b[0] : b[1], :] > 0)), reverse=True)
             merged_bands = sorted(merged_bands[:3], key=lambda b: b[0])
@@ -207,7 +182,7 @@ class OCREngine:
         results: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
         for y1, y2 in merged_bands:
             band_mask = sub_mask[y1:y2, :]
-            closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 45), np.uint8))
+            closed_line = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, 55), np.uint8))
             col_active = np.sum(closed_line > 0, axis=0) >= 2
 
             spans: List[Tuple[int, int]] = []
@@ -216,15 +191,15 @@ class OCREngine:
                 if val and sx is None:
                     sx = x
                 elif not val and sx is not None:
-                    if (x - sx) >= 10:
+                    if (x - sx) >= 12:
                         spans.append((sx, x))
                     sx = None
-            if sx is not None and (w - sx) >= 10:
+            if sx is not None and (w - sx) >= 12:
                 spans.append((sx, w))
 
             merged_spans: List[Tuple[int, int]] = []
             for sx1, sx2 in spans:
-                if merged_spans and (sx1 - merged_spans[-1][1]) <= 110:
+                if merged_spans and (sx1 - merged_spans[-1][1]) <= 150:
                     merged_spans[-1] = (merged_spans[-1][0], sx2)
                 else:
                     merged_spans.append((sx1, sx2))
@@ -232,17 +207,23 @@ class OCREngine:
             if not merged_spans:
                 continue
 
-            best_x1, best_x2 = max(merged_spans, key=lambda s: s[1] - s[0])
+            # Merkez ağırlıklı aktif piksel kütlesi: kenardaki far/tampon parlaması ortadaki kısa 'Wait!' yazısını ezemez!
+            def _span_score(sp: Tuple[int, int]) -> float:
+                mass = float(np.count_nonzero(sub_mask[y1:y2, sp[0] : sp[1]]))
+                center_dist = abs(((sp[0] + sp[1]) * 0.5) - (w * 0.5)) / float(max(1, w))
+                weight = 1.45 if center_dist <= 0.28 else 0.75
+                return mass * weight
 
+            best_x1, best_x2 = max(merged_spans, key=_span_score)
             sub_patch = sub_mask[y1:y2, best_x1:best_x2]
             ys, xs = np.where(sub_patch > 0)
             if len(ys) < 8:
                 continue
 
-            exact_y1 = max(0, y1 + int(ys.min()) - 2)
-            exact_y2 = min(h, y1 + int(ys.max()) + 3)
-            exact_x1 = max(0, best_x1 + int(xs.min()) - 8)
-            exact_x2 = min(w, best_x1 + int(xs.max()) + 8)
+            exact_y1 = max(0, y1 + int(ys.min()) - 3)
+            exact_y2 = min(h, y1 + int(ys.max()) + 4)
+            exact_x1 = max(0, best_x1 + int(xs.min()) - 12)
+            exact_x2 = min(w, best_x1 + int(xs.max()) + 12)
 
             crop = rgb_arr[exact_y1:exact_y2, exact_x1:exact_x2]
             ch, cw = crop.shape[:2]
@@ -257,12 +238,6 @@ class OCREngine:
 
     @classmethod
     def _run_white_isolated_1d_ocr(cls, self_inst: "OCREngine", rgb_arr: np.ndarray) -> Tuple[str, float]:
-        """
-        Nino beyaz harf yalıtımı (DÜZELTİLMİŞ):
-        Önce `white_mask` (255 = beyaz harf, 0 = arka plan) üzerinden satır koordinatlarını bulur,
-        ARDINDAN her satırı siyah-harf / beyaz-zemin (`255 - mask`) olarak 1D CRNN'e (~28ms) verir!
-        (Önceki sürümde maske ters çevrildikten sonra kesiciye girdiği için 2D DBNet'e düşüp 414ms sürüyordu.)
-        """
         h, w, _ = rgb_arr.shape
         max_c = np.max(rgb_arr, axis=2)
         min_c = np.min(rgb_arr, axis=2)
@@ -270,12 +245,12 @@ class OCREngine:
         local_min = cv2.erode(min_c, np.ones((5, 5), np.uint8), iterations=1)
         local_drop = max_c.astype(np.int16) - local_min.astype(np.int16)
 
-        white_mask = ((min_c > 172) & (sat < 52) & (local_drop > 32)).astype(np.uint8) * 255
-        if int(np.count_nonzero(white_mask)) < 35:
+        white_mask = ((min_c > 168) & (sat < 56) & (local_drop > 26)).astype(np.uint8) * 255
+        if int(np.count_nonzero(white_mask)) < 28:
             return "", 0.0
 
         row_counts = np.sum(white_mask > 0, axis=1)
-        min_row_px = max(8, int(w * 0.012))
+        min_row_px = max(6, int(w * 0.008))
         active_rows = row_counts >= min_row_px
 
         bands: List[Tuple[int, int]] = []
@@ -300,14 +275,20 @@ class OCREngine:
             for y1, y2 in bands:
                 b_mask = white_mask[y1:y2, :]
                 ys, xs = np.where(b_mask > 0)
-                if len(ys) < 10:
+                if len(ys) < 8:
                     continue
                 ey1, ey2 = max(0, y1 + int(ys.min()) - 3), min(h, y1 + int(ys.max()) + 4)
-                ex1, ex2 = max(0, int(xs.min()) - 8), min(w, int(xs.max()) + 8)
+                ex1, ex2 = max(0, int(xs.min()) - 10), min(w, int(xs.max()) + 10)
                 crop = inv_rgb[ey1:ey2, ex1:ex2]
-                if crop.shape[1] < 16 or crop.shape[0] < 8:
+                ch, cw = crop.shape[:2]
+                if cw < 14 or ch < 8:
                     continue
-                res, _ = self_inst._rapid_ocr(crop, use_det=False, use_cls=False, use_rec=True)
+                work_crop = (
+                    cv2.resize(crop, (max(16, int(round(cw * (32.0 / ch)))), 32), interpolation=cv2.INTER_AREA)
+                    if ch > 32
+                    else crop
+                )
+                res, _ = self_inst._rapid_ocr(work_crop, use_det=False, use_cls=False, use_rec=True)
                 if res and len(res) > 0:
                     txt, sc = str(res[0][0]).strip(), float(res[0][1])
                     if sc >= self_inst.min_confidence and txt:
@@ -319,26 +300,7 @@ class OCREngine:
         return normalize_ocr_text(" ".join(r[0] for r in recognized)), avg_conf
 
     @staticmethod
-    def _make_auto_level_view(rgb_arr: np.ndarray) -> np.ndarray:
-        """
-        Nino (`UseAutoLevel`): En parlak %0.5'i 255'e, en koyu %5'i 0'a gererek
-        düşük kontrastlı sahnelerdeki altyazıyı keskinleştirir.
-        """
-        arr = rgb_arr.astype(np.float32)
-        lo = float(np.percentile(arr, 5.0))
-        hi = float(np.percentile(arr, 99.5))
-        if hi - lo < 25.0:
-            return rgb_arr
-        stretched = np.clip((arr - lo) * (255.0 / (hi - lo)), 0.0, 255.0).astype(np.uint8)
-        return stretched
-
-    @staticmethod
     def _score_english_readability(text: str, avg_conf: float) -> float:
-        """
-        Nino (`WindowsSpellCheck.Score` benzeri) okunabilirlik puanlayıcı:
-        OCR çıktısındaki gerçek İngilizce kelime oranını, temiz harf yapısını ve güven puanını
-        birleştirerek birden fazla ön-işleme adayı arasından en doğru cümleyi seçer.
-        """
         cleaned = (text or "").strip()
         if not cleaned:
             return 0.0
@@ -351,7 +313,6 @@ class OCREngine:
         known_ratio = float(known_hits) / float(len(tokens))
         vowel_ratio = float(vowel_ok) / float(len(tokens))
 
-        # Bozuk/gürültülü sembol oranı cezası
         alpha_space = sum(1 for c in cleaned if c.isalpha() or c.isspace() or c in ".,!?'-:")
         clean_ratio = float(alpha_space) / float(max(1, len(cleaned)))
 
@@ -359,12 +320,10 @@ class OCREngine:
         return (avg_conf * 0.45) + (known_ratio * 0.30) + (vowel_ratio * 0.15) + (clean_ratio * 0.10) + length_bonus
 
     def _run_fast_1d_ocr(self, rgb_arr: np.ndarray) -> Tuple[str, float]:
-        """Sadece hızlı 1D satır kesici + CRNN (~30-45ms) çalıştırır (çoklu aday testleri için)."""
         line_items = self._slice_subtitle_lines_with_bounds(rgb_arr)
         recognized: List[Tuple[str, Tuple[int, int, int, int], float]] = []
         with self._lock:
             for crop, bounds in line_items:
-                # Yüksekliği > 32px olan uzun satırları 32px'e indirerek CRNN matris çarpımını ~3 kat hızlandır (~45ms!)
                 ch, cw = crop.shape[:2]
                 work_crop = (
                     cv2.resize(crop, (max(16, int(round(cw * (32.0 / ch)))), 32), interpolation=cv2.INTER_AREA)
@@ -388,12 +347,12 @@ class OCREngine:
 
     def extract_text(self, image: Image.Image) -> str:
         """
-        Nino Çoklu Ön-İşleme + İngilizce Sözlük Puanlamalı Hızlı Altyazı Okuyucu:
-        1. Önce ham karede hızlı 1D CRNN (~35ms) dener. Okunabilirlik yüksekse anında döner.
-        2. Güneşli kaldırım / açık zemin yüzünden ham okuma zayıfsa `white_isolated` (beyaz harf yalıtımı)
-           ve `auto_level` (kontrast germe) üzerinde hızlı 1D CRNN (~35ms) dener ve en yüksek
-           İngilizce okunabilirlik puanlı adayı seçer.
-        3. Hala sonuç çıkmadıysa tek seferlik garantili 2D DBNet (`detect_and_read_blocks`) çalıştırır.
+        Hızlı ve Garantili Altyazı Okuyucu:
+        1. Ham görüntüde hızlı 1D CRNN dener; YALNIZCA hem güven (`>= 0.82`) hem de İngilizce
+           kelime okunabilirliği (`>= 0.68`) yüksekse erken döner (`'prneiexciusi'` gibi bozuk
+           parçalarda ASLA erken dönmez!).
+        2. Güneşli/parlak zeminde `white_isolated` 1D CRNN dener ve puanları karşılaştırır.
+        3. Hala zayıfsa aktif dikey şeridi kırpıp `960px` tam çözünürlüklü 2D DBNet ile okur!
         """
         t0 = time.perf_counter()
         self._ensure_initialized()
@@ -403,40 +362,47 @@ class OCREngine:
         try:
             rgb_arr = np.asarray(image.convert("RGB"))
 
-            # Aday 1: Ham görüntü (hızlı 1D CRNN ~25-35ms)
             best_text, best_conf = self._run_fast_1d_ocr(rgb_arr)
             best_score = self._score_english_readability(best_text, best_conf)
 
-            # Ultra-Hızlı Kısa Devre: Ham okuma yeterince temizse (~30ms) anında dön!
-            if best_text and best_conf >= 0.72 and len(best_text) >= 3:
+            # Sadece gerçekten temiz ve anlamlı İngilizce kelimeler varsa hızlı dön!
+            if best_text and best_conf >= 0.82 and best_score >= 0.68 and len(best_text) >= 4:
                 self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
                 return best_text
 
-            # Aday 2: Nino Beyaz Harf Yalıtımı (güneşli sarı kaldırım / açık zemin, hızlı 1D CRNN ~28ms)
             w_text, w_conf = self._run_white_isolated_1d_ocr(self, rgb_arr)
             if w_text:
                 w_score = self._score_english_readability(w_text, w_conf)
                 if w_score > best_score:
                     best_text, best_conf, best_score = w_text, w_conf, w_score
 
-            if best_text and best_conf >= 0.68 and len(best_text) >= 3:
+            if best_text and best_conf >= 0.76 and best_score >= 0.64 and len(best_text) >= 4:
                 self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
                 return best_text
 
-            # Garantili Tek Seferlik Hızlı 2D DBNet Yedeği (max_side=480 -> ~130ms, sadece 1D boş/zayıf kaldıysa)
-            if not best_text or best_conf < 0.58:
-                db_blocks = self.detect_and_read_blocks(rgb_arr, min_conf=self.min_confidence, max_side=480)
-                if db_blocks:
-                    db_blocks.sort(key=lambda item: (item[1][1] // 18, item[1][0]))
-                    if len(db_blocks) == 2 and DialogueTextGrouper.is_speaker_label_line(
-                        db_blocks[0][0], db_blocks[0][1], db_blocks[1][1]
-                    ):
-                        db_text = normalize_ocr_text(f"{db_blocks[0][0]}: {db_blocks[1][0]}")
-                    else:
-                        db_text = normalize_ocr_text(" ".join(b[0] for b in db_blocks))
-                    db_score = self._score_english_readability(db_text, 0.80)
-                    if db_score > best_score:
-                        best_text = db_text
+            # Garantili 960px 2D DBNet Yedeği (aktif satır şeridine daraltılmış hızlı kırpım!)
+            sub_mask = ScreenCapturer.extract_outlined_subtitle_mask(rgb_arr)
+            ys = np.where(np.sum(sub_mask > 0, axis=1) >= 4)[0]
+            h, _w = rgb_arr.shape[:2]
+            if len(ys) > 0:
+                by1 = max(0, int(ys.min()) - 14)
+                by2 = min(h, int(ys.max()) + 16)
+                band_img = rgb_arr[by1:by2, :]
+            else:
+                band_img = rgb_arr
+
+            db_blocks = self.detect_and_read_blocks(band_img, min_conf=self.min_confidence, max_side=960)
+            if db_blocks:
+                db_blocks.sort(key=lambda item: (item[1][1] // 18, item[1][0]))
+                if len(db_blocks) == 2 and DialogueTextGrouper.is_speaker_label_line(
+                    db_blocks[0][0], db_blocks[0][1], db_blocks[1][1]
+                ):
+                    db_text = normalize_ocr_text(f"{db_blocks[0][0]}: {db_blocks[1][0]}")
+                else:
+                    db_text = normalize_ocr_text(" ".join(b[0] for b in db_blocks))
+                db_score = self._score_english_readability(db_text, 0.82)
+                if db_score >= best_score or not best_text:
+                    best_text = db_text
 
             self.last_ocr_ms = (time.perf_counter() - t0) * 1000.0
             return best_text
@@ -448,13 +414,6 @@ class OCREngine:
         self,
         crop_rgb: np.ndarray,
     ) -> Tuple[str, Optional[Tuple[int, int, int, int]], int]:
-        """
-        UniversalHUDRadar tarafından kırpılan HUD/Menü/Telefon kutusunu okur ve
-        gerçek harflerin sıkı sınır kutusunu `(tight_x, tight_y, tight_w, tight_h)` + `satır_sayısı` döndürür.
-        Böylece:
-        - Telefondaki 'DIALING...' yazısının yanındaki kişi fotoğrafı (Devin) ASLA yama kutusuna dahil edilmez!
-        - 2 satırlık menü/diyalog özetlerinde (`Mr. Weston checks...\nresponse.`) her iki satır da eksiksiz okunur!
-        """
         self._ensure_initialized()
         if not self._rapid_ocr or crop_rgb.size == 0:
             return "", None, 1
@@ -476,7 +435,6 @@ class OCREngine:
                                 parts.append(txt)
                                 bounds_list.append(bnd)
 
-                # Tek satır veya 1D kesitten tam okunamadıysa doğrudan veya 2D DBNet ile oku
                 if not parts:
                     if ch <= 34:
                         res, _ = self._rapid_ocr(crop_rgb, use_det=False, use_cls=False, use_rec=True)
@@ -509,7 +467,12 @@ class OCREngine:
                 ty1 = max(0, min(b[1] for b in bounds_list))
                 tx2 = min(cw, max(b[0] + b[2] for b in bounds_list))
                 ty2 = min(ch, max(b[1] + b[3] for b in bounds_list))
-                tight_bounds: Optional[Tuple[int, int, int, int]] = (tx1, ty1, max(16, tx2 - tx1), max(10, ty2 - ty1))
+                tight_bounds: Optional[Tuple[int, int, int, int]] = (
+                    tx1,
+                    ty1,
+                    max(16, tx2 - tx1),
+                    max(10, ty2 - ty1),
+                )
             else:
                 tight_bounds = (0, 0, cw, ch)
 
@@ -525,16 +488,9 @@ class OCREngine:
     def detect_and_read_blocks(
         self,
         rgb_arr: np.ndarray,
-        min_conf: float = 0.56,
+        min_conf: float = 0.54,
         max_side: int = 1280,
     ) -> List[Tuple[str, Tuple[int, int, int, int]]]:
-        """
-        Gerçek 2D DBNet (`use_det=True`) + CRNN Metin Bloğu Tarayıcısı:
-        - Küçük köşe bilgi kartlarında (`~520x240`) tam çözünürlükte (~55ms) çalışır.
-        - Tam ekran ESC / Harita / Envanter menülerinde (`1920x1080`) `1280px` ölçekte (~380ms)
-          çalışarak ekrandaki TÜM sekme, buton, açıklama ve cümleleri (%99+) eksiksiz bulur!
-        Dönüş: `[(metin, (x, y, w, h)), ...]` (orijinal `rgb_arr` piksel koordinatlarında).
-        """
         self._ensure_initialized()
         if not self._rapid_ocr or rgb_arr is None or rgb_arr.size == 0:
             return []

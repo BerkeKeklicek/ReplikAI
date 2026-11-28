@@ -41,16 +41,25 @@ DESKTOP_NOISE_PATTERNS = (
 # Sadece Türkçede bulunan harfler + ASCII'ye dönüşmüş yaygın Türkçe kelimeler
 # (Türkçeyi Türkçeye çevirmeyi %100 engeller; Türkçe hariç her dili Türkçeye çevirir)
 TURKISH_SPECIFIC_CHARS = set("ğĞşŞıİ")
+# DİKKAT: 'once', 'ama', 'var' gibi İngilizcede de sık geçen kelimeler ASLA bu listede yer almaz!
 TURKISH_COMMON_WORDS = {
     "bir", "için", "icin", "olan", "olarak", "değil", "degil",
     "yeni", "kaynak", "bayt", "oyun", "oyunu", "bolge", "bölge", "çeviri",
     "ceviri", "lütfen", "lutfen", "evet", "hayır", "hayir", "tamam",
     "veya", "ile", "dene", "bakalim", "bakalım", "reisim", "nasil", "nasıl",
-    "simdi", "şimdi", "sadece", "ama", "fakat", "ancak", "gibi", "daha",
-    "cok", "çok", "var", "yok", "bunu", "sunu", "oyle", "boyle", "kanka",
+    "simdi", "şimdi", "sadece", "fakat", "ancak", "gibi", "daha",
+    "cok", "çok", "yok", "bunu", "sunu", "oyle", "boyle", "kanka",
     "hocam", "merhaba", "selam", "altyazi", "altyazı", "ekran", "pencere",
     "uygulama", "ayarlar", "baslat", "durdur", "cunku", "çünkü", "belki",
-    "zaten", "hemen", "sonra", "once", "önce", "senin", "benim", "bizim",
+    "zaten", "hemen", "sonra", "önce", "senin", "benim", "bizim",
+}
+
+SHORT_VALID_ENGLISH_EXCLAMATIONS = {
+    "hey", "run", "yes", "why", "now", "out", "who", "how",
+    "wait", "stop", "help", "what", "yeah", "okay", "sure", "shit",
+    "fuck", "damn", "move", "nice", "good", "dead", "fire", "jump",
+    "hide", "look", "come", "back", "here", "stay", "fine", "well",
+    "nope", "whoa", "hold", "open", "shut", "kill", "go",
 }
 
 
@@ -81,8 +90,10 @@ def normalize_ocr_text(text: str) -> str:
         cleaned = " ".join(raw_words[:-1])
 
     alpha_count = sum(1 for ch in cleaned if ch.isalpha())
+    low_words_check = re.findall(r"[a-zA-ZçğıöşüÇĞİÖŞÜ']+", cleaned.lower())
     if alpha_count < 4:
-        return ""
+        if not (len(low_words_check) == 1 and low_words_check[0] in SHORT_VALID_ENGLISH_EXCLAMATIONS):
+            return ""
 
     # Zaten Türkçe özel harfler içeriyorsa çevirme
     if any(ch in TURKISH_SPECIFIC_CHARS for ch in cleaned):
@@ -93,12 +104,12 @@ def normalize_ocr_text(text: str) -> str:
         if pat in low:
             return ""
 
-    words = re.findall(r"[a-zA-ZçğıöşüÇĞİÖŞÜ']+", low)
+    words = low_words_check
     if not words:
         return ""
 
-    # Tek kelimelik çok kısa gürültüleri ele (en az 2 kelime veya >=5 harfli anlamlı kelime olmalı)
-    if len(words) == 1 and len(words[0]) < 5:
+    # Tek kelimelik çok kısa gürültüleri ele; ancak gerçek oyun ünlemlerine ("Wait!", "Stop!", "Hey!") izin ver
+    if len(words) == 1 and len(words[0]) < 5 and words[0] not in SHORT_VALID_ENGLISH_EXCLAMATIONS:
         return ""
 
     if any(w in TURKISH_COMMON_WORDS for w in words):

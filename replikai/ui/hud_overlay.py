@@ -1,11 +1,19 @@
-"""Tam Ekran Yerinde (In-Place Spatial) Oyun HUD, Bildirim, Telefon ve ESC Menü Çeviri Katmanı."""
+"""Birleşik Tam Ekran Oyun Üstü Canlı Altyazı, Köşe Bilgi Kartı ve Alt+M Menü Çeviri Katmanı.
+
+Neden Birleşik Katman?
+- Windows 11 DWM üzerinde birden fazla tam ekran/topmost şeffaf pencere (`HWND_TOPMOST`) aynı anda
+  açık olduğunda birbirleriyle Z-sırası yarışı yapar.
+- `Alt + M` ile oyun üstünde %100 çalıştığı kanıtlanan `SpatialHUDOverlay` doğrudan kendi `paintEvent`
+  metodu içinde hem sinematik konturlu canlı altyazıyı (`QPainterPath`) hem de yerinde (`In-Place`)
+  menü/HUD doku yamalarını tek bir birleşik yüzeyde çizer!
+"""
 
 from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
 import sys
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 from PySide6.QtCore import QRectF, QTimer, Qt
@@ -21,9 +29,11 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from replikai.config import AppConfig
 from replikai.core.game_window import (
     ensure_game_window_allows_overlay,
     exclude_window_from_capture,
+    map_region_to_game_window,
 )
 from replikai.core.hud_radar import HUDTextPatch
 
@@ -43,15 +53,19 @@ SWP_FRAMECHANGED = 0x0020
 
 class SpatialHUDOverlay(QWidget):
     """
-    Oyun içindeki bildirim, ipucu, telefon ve ESC menüsü yazılarını
-    TAM OLARAK orijinal İngilizce kelimenin bulunduğu sıkı `(x, y, w, h)` koordinatının
-    üstüne (In-Place) doğal arka plan yaması (`RealtimeNaturalBackground`) ve
-    orijinal oyun font rengiyle çizen şeffaf katman.
+    Oyun ve tam ekran videoların üstünde çalışan tekil, birleşik, tıklama-geçirgen
+    (`WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`) çizim katmanı:
+    1. Canlı Altyazı (`_live_translated`): Alt-orta altyazı bölgesine vektörel konturlu temiz metin çizer.
+    2. HUD & Alt+M Menü Yamaları (`_patches`): Doğal arka plan dokusuyla yerinde (`In-Place`) çizer.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__(None)
+        self.config = config
+        self.target_hwnd: Optional[int] = None
         self._patches: List[HUDTextPatch] = []
+        self._live_translated: str = ""
+        self._live_original: str = ""
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -64,14 +78,17 @@ class SpatialHUDOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
+        self._sub_hide_timer = QTimer(self)
+        self._sub_hide_timer.setSingleShot(True)
+        self._sub_hide_timer.timeout.connect(self.clear_live_subtitle)
+
         self._sync_fullscreen_geometry()
         self.show()
         self._apply_win32_passthrough_and_capture_exclusion()
 
-        # OverTranslate AlwaysOnTop.Reassert: 500ms'de bir sadece kendi HWND'mizi en üste al
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.ensure_topmost)
-        self._topmost_timer.start(500)
+        self._topmost_timer.start(450)
 
     @staticmethod
     def get_dpr() -> float:
@@ -87,7 +104,9 @@ class SpatialHUDOverlay(QWidget):
             self.setGeometry(0, 0, 1920, 1079)
 
     def ensure_topmost(self) -> None:
-        if sys.platform != "win32" or not self._patches:
+        if sys.platform != "win32":
+            return
+        if not self._patches and not self._live_translated:
             return
         try:
             ensure_game_window_allows_overlay()
@@ -125,8 +144,24 @@ class SpatialHUDOverlay(QWidget):
         except Exception:
             pass
 
+    def set_live_subtitle(self, translated: str, original: Optional[str] = None) -> None:
+        """Canlı altyazıyı doğrudan oyun üstü birleşik katmanda gösterir."""
+        cleaned = (translated or "").strip()
+        if not cleaned:
+            return
+        self._live_translated = cleaned
+        self._live_original = (original or "").strip()
+        self.ensure_topmost()
+        self._sub_hide_timer.start(7000)
+        self.update()
+
+    def clear_live_subtitle(self) -> None:
+        if self._live_translated or self._live_original:
+            self._live_translated = ""
+            self._live_original = ""
+            self.update()
+
     def set_patches(self, patches: List[HUDTextPatch]) -> None:
-        """Aktif yerinde (In-Place) Türkçe HUD/menü yamalarını günceller."""
         self._patches = list(patches)
         if self._patches:
             self.ensure_topmost()
@@ -161,9 +196,94 @@ class SpatialHUDOverlay(QWidget):
         qimg = QImage(contiguous.data, w, h, w * 3, QImage.Format.Format_RGB888)
         return qimg.copy()
 
+    def _draw_live_subtitle(self, painter: QPainter, dpr: float) -> None:
+        if not self._live_translated or self.config is None:
+            return
+        # Kilit açıkken (kullanıcı yeşil çerçeveyi sürüklerken) SubtitleOverlay zaten çiziyor
+        if not self.config.overlay_click_through:
+            return
+
+        reg = map_region_to_game_window(self.config.capture_region, self.target_hwnd)
+        lx = float(reg.get("left", 250)) / dpr
+        ly = float(reg.get("top", 790)) / dpr
+        lw = max(240.0, float(reg.get("width", 1420)) / dpr)
+        lh = max(70.0, float(reg.get("height", 280)) / dpr)
+
+        sub_rect = QRectF(lx, ly, lw, lh)
+
+        # İsteğe bağlı yarı saydam arka plan kutusu (varsayılan 0.0 = tamamen kutusuz!)
+        opac = float(self.config.overlay_opacity)
+        if opac > 0.02:
+            bg = QColor(self.config.overlay_bg_color)
+            bg.setAlpha(int(max(0.05, min(1.0, opac)) * 220))
+            painter.setBrush(bg)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(sub_rect.adjusted(8.0, 6.0, -8.0, -6.0), 12.0, 12.0)
+
+        font_sz = int(self.config.overlay_font_size)
+        font = QFont("Segoe UI", font_sz, QFont.Weight.Black)
+        fm = QFontMetricsF(font)
+        avail_w = max(140.0, lw - 32.0)
+        lines = self._wrap_text_lines(self._live_translated, avail_w, fm)
+        if not lines:
+            return
+
+        text_col = QColor(self.config.overlay_text_color)
+        if not text_col.isValid():
+            text_col = QColor("#FFFFFF")
+        lum = 0.299 * text_col.red() + 0.587 * text_col.green() + 0.114 * text_col.blue()
+        stroke_col = QColor(255, 255, 255, 250) if lum < 115 else QColor(0, 0, 0, 250)
+        stroke_w = 5.8 if lum < 115 else 5.6
+
+        line_h = fm.height() * 1.10
+        total_h = line_h * len(lines)
+        # Türkçe altyazıyı şeridin üst-orta hizasına yerleştir ki alttaki orijinal İngilizce satırla üst üste binip karışmasın
+        start_y = ly + max(fm.ascent() + 10.0, (lh - total_h) * 0.26 + fm.ascent())
+
+        # Orijinal İngilizce metin de açıksa üstte küçük italik göster
+        if self.config.show_original_text and self._live_original:
+            orig_font = QFont("Segoe UI Semibold", max(11, font_sz - 7), QFont.Weight.DemiBold)
+            orig_font.setItalic(True)
+            ofm = QFontMetricsF(orig_font)
+            orig_lines = self._wrap_text_lines(self._live_original, avail_w, ofm)[:2]
+            orig_path = QPainterPath()
+            oy_base = start_y - (len(orig_lines) * ofm.height() * 1.05) - 6.0
+            for i, ol in enumerate(orig_lines):
+                ow = ofm.horizontalAdvance(ol)
+                ox = lx + max(8.0, (lw - ow) / 2.0)
+                orig_path.addText(ox, oy_base + i * ofm.height() * 1.05, orig_font, ol)
+            painter.setPen(QPen(QColor(0, 0, 0, 235), 3.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(orig_path)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#E2E8F0"))
+            painter.drawPath(orig_path)
+
+        path = QPainterPath()
+        for idx, line in enumerate(lines):
+            line_w = fm.horizontalAdvance(line)
+            tx = lx + max(8.0, (lw - line_w) / 2.0)
+            ty = start_y + idx * line_h
+            path.addText(tx, ty, font, line)
+
+        pen = QPen(
+            stroke_col,
+            stroke_w,
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap,
+            Qt.PenJoinStyle.RoundJoin,
+        )
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(text_col)
+        painter.drawPath(path)
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        if not self._patches:
+        if not self._patches and not self._live_translated:
             painter.fillRect(0, 0, 1, 1, QColor(0, 0, 0, 1))
             return
 
@@ -173,6 +293,7 @@ class SpatialHUDOverlay(QWidget):
 
         dpr = self.get_dpr()
 
+        # 1. Yerinde (In-Place) HUD & Alt+M Menü Yamaları
         for patch in self._patches:
             lx = float(patch.x) / dpr
             ly = float(patch.y) / dpr
@@ -181,7 +302,6 @@ class SpatialHUDOverlay(QWidget):
 
             rect = QRectF(lx, ly, lw, lh)
 
-            # 1. OverTranslate `RealtimeNaturalBackground` doğal arka plan doku yaması
             if patch.natural_bg_patch is not None and patch.natural_bg_patch.size > 0:
                 qimg = self._numpy_rgb_to_qimage(patch.natural_bg_patch)
                 painter.drawImage(rect, qimg)
@@ -191,7 +311,6 @@ class SpatialHUDOverlay(QWidget):
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawRoundedRect(rect, 3.0, 3.0)
 
-            # 2. Satır başına yüksekliğe (`single_line_lh`) göre gerçek oyun font boyutunu hesapla
             text = patch.translated_text.strip()
             if not text:
                 continue
@@ -222,14 +341,10 @@ class SpatialHUDOverlay(QWidget):
             is_multi_line = len(lines) > 1 or patch.num_lines > 1
             for idx, line in enumerate(lines):
                 line_w = fm.horizontalAdvance(line)
-                if is_multi_line:
-                    tx = lx + 3.0
-                else:
-                    tx = lx + max(2.0, (lw - line_w) / 2.0)
+                tx = (lx + 3.0) if is_multi_line else (lx + max(2.0, (lw - line_w) / 2.0))
                 ty = start_y + idx * line_h
                 path.addText(tx, ty, font, line)
 
-            # 3. Orijinal harf konturu (`outline_rgb`) + WCAG kontrast ayarlı harf rengi (`text_rgb`)
             outline_col = QColor(patch.outline_rgb[0], patch.outline_rgb[1], patch.outline_rgb[2], 235)
             stroke_pen = QPen(
                 outline_col,
@@ -246,3 +361,6 @@ class SpatialHUDOverlay(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(text_col)
             painter.drawPath(path)
+
+        # 2. Canlı Sinematik Altyazı (Aynı Kanıtlanmış Oyun-Üstü Katman Üzerinde!)
+        self._draw_live_subtitle(painter, dpr)

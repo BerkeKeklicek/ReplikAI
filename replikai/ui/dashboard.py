@@ -8,7 +8,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -239,7 +239,7 @@ class ReplikAIDashboard(QMainWindow):
             self.config_data,
             on_region_moved=self._on_overlay_region_moved,
         )
-        self.hud_overlay = SpatialHUDOverlay()
+        self.hud_overlay = SpatialHUDOverlay(self.config_data)
         self._build_ui()
         self._register_hotkeys()
         self.refresh_game_window_list()
@@ -247,6 +247,13 @@ class ReplikAIDashboard(QMainWindow):
 
         # Kendi kontrol panelini de ekran yakalamadan gizle ki asla masaüstü/panel yazısını okumasın!
         exclude_window_from_capture(int(self.winId()))
+
+        # Uygulama açıldığında kullanıcı Başlat'a basmayı unutsa bile canlı altyazı takibini otomatik başlat!
+        QTimer.singleShot(350, self._auto_start_scanning)
+
+    def _auto_start_scanning(self) -> None:
+        if not self.pipeline.is_running:
+            self.toggle_scanning()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -801,11 +808,13 @@ class ReplikAIDashboard(QMainWindow):
 
         self.window_combo.setCurrentIndex(detected_idx)
         self.pipeline.target_hwnd = self._window_entries[detected_idx][0]
+        self.hud_overlay.target_hwnd = self.pipeline.target_hwnd
         self.window_combo.blockSignals(False)
 
     def _on_target_window_changed(self, index: int) -> None:
         if 0 <= index < len(self._window_entries):
             self.pipeline.target_hwnd = self._window_entries[index][0]
+            self.hud_overlay.target_hwnd = self.pipeline.target_hwnd
             self.refresh_region_preview()
 
     def apply_borderless_fullscreen_fix(self) -> None:
@@ -837,6 +846,7 @@ class ReplikAIDashboard(QMainWindow):
         self.slider_opac.setValue(0)
         self.config_data.save()
         self.overlay.apply_config()
+        self.hud_overlay.update()
 
     def _on_overlay_sliders_changed(self) -> None:
         self.config_data.overlay_font_size = int(self.slider_font.value())
@@ -855,6 +865,7 @@ class ReplikAIDashboard(QMainWindow):
 
         self.config_data.save()
         self.overlay.apply_config()
+        self.hud_overlay.update()
 
     def save_settings(self) -> None:
         self.config_data.provider = PROVIDER_DISPLAY_TO_KEY.get(
@@ -898,6 +909,7 @@ class ReplikAIDashboard(QMainWindow):
 
     def _on_clear_subtitle_ui(self) -> None:
         self.overlay.clear_subtitle()
+        self.hud_overlay.clear_live_subtitle()
 
     def _on_hud_patches_ui(self, patches: list) -> None:
         self.hud_overlay.set_patches(patches)
@@ -965,6 +977,7 @@ class ReplikAIDashboard(QMainWindow):
     def toggle_overlay_lock(self) -> None:
         new_state = not self.config_data.overlay_click_through
         self.overlay.set_click_through(new_state)
+        self.hud_overlay.update()
         self.config_data.save()
         if new_state:
             self.btn_toggle_lock.setText("📐  Altyazı Alanını Göster / Taşı (Alt+L)")
@@ -1020,11 +1033,16 @@ class ReplikAIDashboard(QMainWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_translation_ui(self, event: TranslationEvent) -> None:
-        self.overlay.update_subtitle(
+        self.hud_overlay.set_live_subtitle(
             translated=event.translated_text,
             original=event.source_text,
-            provider=event.provider,
         )
+        if not self.config_data.overlay_click_through:
+            self.overlay.update_subtitle(
+                translated=event.translated_text,
+                original=event.source_text,
+                provider=event.provider,
+            )
         self.metric_latency[1].setText(
             f"{event.latency_ms:.0f} ms (OCR:{event.ocr_ms:.0f}/Ağ:{event.translate_ms:.0f})"
         )

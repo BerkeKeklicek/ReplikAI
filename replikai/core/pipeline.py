@@ -17,12 +17,24 @@ MİMARİ:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+from pathlib import Path
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+# Canlı teşhis günlüğü (data/replikai_debug.log)
+_LOG_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "replikai_debug.log"
+_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+_pipe_logger = logging.getLogger("replikai.pipeline")
+if not _pipe_logger.handlers:
+    _fh = logging.FileHandler(_LOG_PATH, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+    _pipe_logger.addHandler(_fh)
+    _pipe_logger.setLevel(logging.INFO)
 
 from replikai.config import AppConfig
 from replikai.core.cache import TranslationCache, is_similar_text, normalize_ocr_text
@@ -346,14 +358,19 @@ class TranslationPipeline:
 
         cleaned = normalize_ocr_text(raw_text)
         if not cleaned:
+            if not force:
+                self.capturer.allow_fadein_recheck()
             return None
 
         # 3D yol/plaka/far yansıması gürültüsünün (ör. "IIl", "00", "||") ağa gidip kota harcamasını engelle:
         alpha_chars = [c for c in cleaned if c.isalpha()]
         has_vowel = any(c.lower() in "aeiouy" for c in alpha_chars)
         if len(alpha_chars) < 3 or not has_vowel:
+            if not force:
+                self.capturer.allow_fadein_recheck()
             return None
 
+        self.capturer.mark_recognized_ok()
         self._empty_ticks = 0
         if not force and is_similar_text(cleaned, self._last_ocr_text, threshold=0.88):
             return None
@@ -413,6 +430,15 @@ class TranslationPipeline:
 
         self._subtitle_shown = True
         latency = (time.perf_counter() - t0) * 1000.0
+        _pipe_logger.info(
+            "SUBTITLE OK [%.0fms | OCR:%.0fms | TR:%.0fms | %s] %r => %r",
+            latency,
+            ocr_ms,
+            tr_ms,
+            provider_label,
+            query_text,
+            translated,
+        )
         event = TranslationEvent(
             source_text=query_text,
             translated_text=translated,

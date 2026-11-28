@@ -74,11 +74,11 @@ GAME_PROFILES: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class CaptureRegion:
-    # Evrensel alt-orta altyazı şeridi (x: %17..%83, y: %76..%95 — minimap ve köşe HUD hariç)
-    left: int = 330
-    top: int = 820
-    width: int = 1260
-    height: int = 210
+    # Evrensel alt-orta altyazı şeridi (x: %13..%87, y: %73..%99 — GTA 5 %100 Safezone en alt satır dahil!)
+    left: int = 250
+    top: int = 790
+    width: int = 1420
+    height: int = 280
 
     def to_dict(self) -> Dict[str, int]:
         return {
@@ -95,8 +95,8 @@ class AppConfig:
     capture_region: Dict[str, int] = field(
         default_factory=lambda: CaptureRegion().to_dict()
     )
-    scan_interval_ms: int = 220
-    pixel_diff_threshold: float = 2.2
+    scan_interval_ms: int = 120
+    pixel_diff_threshold: float = 1.4
     preprocess_contrast: bool = True
 
     # Çeviri Motoru Ayarları
@@ -144,7 +144,18 @@ class AppConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
             valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
             filtered: Dict[str, Any] = {k: v for k, v in data.items() if k in valid_keys}
-            return cls(**filtered)
+            cfg = cls(**filtered)
+            # Eski varsayılan bölge (y=820..1030) GTA 5 %100 Safezone alt satırını kestiği için otomatik genişlet
+            reg = cfg.capture_region or {}
+            if (
+                int(reg.get("left", 0)) in (250, 260)
+                and int(reg.get("width", 0)) in (1400, 1420)
+                and (int(reg.get("top", 0)) + int(reg.get("height", 0))) <= 1035
+            ):
+                cfg.capture_region = CaptureRegion().to_dict()
+                cfg.pixel_diff_threshold = min(1.5, float(cfg.pixel_diff_threshold))
+                cfg.save(path)
+            return cfg
         except Exception:
             return cls()
 

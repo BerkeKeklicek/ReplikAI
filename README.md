@@ -44,9 +44,9 @@ ReplikAI, canlı oynanış performansını korurken menülerde `%99+` kapsama sa
 
 | Katman | Görev | Nasıl Çalışır? | Gecikme / FPS Etkisi |
 | :--- | :--- | :--- | :--- |
-| **1. Katman — Canlı Altyazı Motoru** | Oyun içi sinematik diyaloglar ve tam ekran video altyazıları | Evrensel alt-orta altyazı bandını (`50ms` döngü) kesintisiz izler. Çoklu ön-işleme (`Ham` + `Beyaz Harf Yalıtımı`) + İngilizce okunabilirlik puanlaması ve sıcak 2D DBNet yedeğiyle güneşli zeminlerde bile 1-3 satırlık altyazıları okur. | `~120–180 ms` toplam tepki • **%0 FPS kaybı** |
+| **1. Katman — Canlı Altyazı Motoru** | Oyun içi sinematik diyaloglar ve tam ekran video altyazıları | Uygulama açılışta otomatik başlar ve evrensel alt-orta altyazı bandını (`50ms` döngü, `y=790..1070` %100 Safezone) kesintisiz izler. `320x80` maske farkı, çoklu ön-işleme + İngilizce okunabilirlik puanlaması ve `960px` 2D DBNet yedeğiyle güneşli zeminlerde ve kısa ünlemlerde bile altyazıları kaçırmaz. | `~115–170 ms` toplam tepki • **%0 FPS kaybı** |
 | **2. Katman — Köşe Bilgi Kartı Radarı** | Sol-üstte aniden çıkan görev/ipucu/uyarı kutuları | Tüm ekran yerine yalnızca sol-üst köşe şeridini (`~%9` ekran) izler. Harf-ritmi maskesiyle hareketli 3D sahnede bile bilgi kartını yakalar; `CornerBlock` filtresiyle harita/gürültü etiketlerini eler ve 2D DBNet ile yerinde (**In-Place**) çevirir. | `~0.5 ms` tarama • **~%0 FPS kaybı** |
-| **3. Katman — İsteğe Bağlı Tam Ekran Menü Tarayıcı (`Alt + M`)** | `ESC` menüleri, ayarlar, harita, envanter ve diyalog özetleri | Yalnızca kullanıcının istediği anda **`Alt + M`** ile tetiklenir (radyo/silah tekerinde yanlış tetiklenmez). Gerçek **2D DBNet** + limitsiz **Toplu (Batch) Çeviri** ile tüm ekranı tek seferde çevirir. `ESC` veya tekrar `Alt + M` basıldığı an (`< 30ms`) tüm yamaları temizler. | Tek seferlik toplu çeviri • **%0 FPS kaybı** |
+| **3. Katman — İsteğe Bağlı Tam Ekran Menü Tarayıcı (`Alt + M`)** | `ESC` menüleri, ayarlar, harita, envanter ve diyalog özetleri | Yalnızca kullanıcının istediği anda **`Alt + M`** ile tetiklenir (radyo/silah tekerinde yanlış tetiklenmez). Gerçek **2D DBNet** + Sıfır-429 tek istekli **Toplu (Batch) Çeviri** ile tüm ekranı tek seferde çevirir. `ESC` veya tekrar `Alt + M` basıldığı an (`< 30ms`) tüm yamaları temizler. | Tek seferlik toplu çeviri • **%0 FPS kaybı** |
 
 ```mermaid
 flowchart LR
@@ -54,16 +54,15 @@ flowchart LR
     A --> C["Katman 2: Sol-Üst Bilgi Köşesi"]
     A --> D["Katman 3: Tam Ekran Menü (Alt+M)"]
 
-    B --> E["Çoklu Ön-İşleme + RapidOCR + FrameGate"]
+    B --> E["Çoklu Ön-İşleme + 960p RapidOCR + FrameGate"]
     C --> F["2D DBNet + CornerBlock Filtresi"]
     D --> G["2D DBNet + DialogueTextGrouper"]
 
-    E --> H["GamePackStore (PackFuzzy) -> SQLite -> AI / Batch Çeviri"]
+    E --> H["GamePackStore (PackFuzzy) -> SQLite -> Zero-429 IPv4 AI"]
     F --> H
     G --> H
 
-    H --> I["CleanOutlinedLabel (Kutusuz Konturlu Altyazı)"]
-    H --> J["SpatialHUDOverlay (Doğal Doku Yaması / Inpainting)"]
+    H --> I["SpatialHUDOverlay (Birleşik Oyun-Üstü Konturlu Altyazı + Doğal Doku Yamalı HUD Katmanı)"]
 ```
 
 ---

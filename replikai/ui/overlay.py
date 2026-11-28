@@ -328,14 +328,15 @@ class SubtitleOverlay(QWidget):
         self.guide_label.setVisible(not enabled)
 
         if not enabled:
+            self.show()
             if not self._has_active_text:
                 self.translated_label.setText("Altyazı Alanını Oyundaki / Videodaki Altyazının Üzerine Sürükleyin")
                 self.translated_label.setVisible(True)
         else:
-            if not self._has_active_text:
-                self.translated_label.setText("")
-                self.translated_label.setVisible(False)
-                self.source_label.setVisible(False)
+            # Kilitli modda canlı altyazıyı zaten oyun üstünde %100 çalışan SpatialHUDOverlay çiziyor;
+            # ikinci bir HWND_TOPMOST penceresinin Z-sırası yarışı yapmaması için bu rehber penceresini gizle!
+            self.hide()
+            return
 
         if sys.platform == "win32":
             try:
